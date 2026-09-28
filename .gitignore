@@ -1,0 +1,20 @@
+# ---- macOS 系统文件 ----
+.DS_Store
+
+# ---- 第三方 helm chart 二进制：不入库，避免仓库膨胀与版本漂移 ----
+# 部署前需手动放置或从 helm registry 拉取（oci://docker.io/envoyproxy/gateway-helm v1.6.1、
+# oci://registry-1.docker.io/bitnamicharts/harbor 27.0.3），见 README 各组件说明。
+/local-kind-dev/deploy/*.tgz
+/harbor/*.tgz
+
+# ---- 证书生成产物（cert-create.sh 运行期生成；含 *.key 私钥，绝不入库）----
+/cert-build/certs/
+
+# ---- 密钥/凭据记录（harbor 固定密钥，绝不入库；本地保存、helm upgrade 时引用）----
+/harbor/harbor-secrets.txt
+
+# ---- 外部参考材料 / 命令笔记（非本项目代码）----
+# envoygateway/：Envoy Gateway 官方命令速查 + examples/ 官方示例 yaml（coffee 样例）
+/envoygateway/
+# harbor 安装/命令笔记（内含完整 values heredoc 与明文口令，正式 values 以 harbor/values.yaml 为准）
+/harbor/harbor-command-guide.txt

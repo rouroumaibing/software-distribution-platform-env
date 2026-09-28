@@ -1,0 +1,61 @@
+# Harbor - bitnamicharts/harbor 27.0.3
+# user: admin
+adminPassword: "Admin@123"
+externalURL: https://harbor.sdpworkflow.com
+
+exposureType: proxy
+service:
+  type: ClusterIP
+nginx:
+  tls:
+    enabled: false         # TLS 在 Envoy Gateway 终止，nginx 用 HTTP(80)
+  behindReverseProxy: true # 位于反向代理之后，保留 X-Forwarded-Proto，保证 docker login 的 token 地址为 https
+  image:
+    repository: bitnamilegacy/nginx
+
+core:
+  image:
+    repository: bitnamilegacy/harbor-core
+  secret: "3fcd7fa502d30cbf"
+  xsrfKey: "f56e62d12c419eb501e58862d0a9bb84"
+jobservice:
+  image:
+    repository: bitnamilegacy/harbor-jobservice
+  secret: "369938d94b4a7632"
+registry:
+  server:
+    image:
+      repository: bitnamilegacy/harbor-registry
+  controller:
+    image:
+      repository: bitnamilegacy/harbor-registryctl
+  secret: "239e3b4da53bcec5"
+
+persistence:
+  enabled: true
+  resourcePolicy: keep
+  persistentVolumeClaim:
+    registry:
+      size: 50Gi
+
+global:
+  security:
+    allowInsecureImages: true
+portal:
+  image:
+    repository: bitnamilegacy/harbor-portal
+trivy:
+  image:
+    repository: bitnamilegacy/harbor-adapter-trivy
+exporter:
+  image:
+    repository: bitnamilegacy/harbor-exporter
+volumePermissions:
+  image:
+    repository: bitnamilegacy/os-shell
+postgresql:
+  image:
+    repository: bitnamilegacy/postgresql
+redis:
+  image:
+    repository: bitnamilegacy/redis

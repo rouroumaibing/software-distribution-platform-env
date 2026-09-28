@@ -1,0 +1,75 @@
+# 本地脚手架：平台统一入口（Envoy Gateway）网关级资源 —— 归 local-kind-dev/deploy/（software-distribution-platform-env 仓），**不随 hub/runner/console 三仓打包**。
+#
+# 边界（2026-09-23 拍板）：kind 集群定义、EG controller、本文件的 Gateway 级资源都是
+# "项目外的本地测试基础设施"；三个项目仓（hub/runner/console）互相独立、也独立于根，
+# 各自 chart 只带**自己的** HTTPRoute（按名字引用本文件的 Gateway，名字可 helm --set 覆盖）。
+#
+# NodePort 与本目录 kind.yaml 的 extraPortMappings 成对（EnvoyProxy CRD v1.6.1 无 nodePorts
+# 字段，由 deploy-local.sh 在 envoy svc 创建后 patch 固定）：
+#   host 8080 —— 已释放：hub 不再 NodePort 直连，统一经 Gateway（PathPrefix /api -> hub）
+#   host 8082 -> node 30081（网关 http，listener 80）
+#   host 8443 -> node 30443（网关 https；curl 用 --resolve www.sdpworkflow.com:8443:127.0.0.1）
+#
+# https listener 端口刻意用 8443 而非 443（2026-09-23，真对接 Keycloak 的裁定）：
+# issuer/浏览器/hub 三方必须用同一 URL（https://www.sdpworkflow.com:8443/...）。listener 443
+# 会令 X-Forwarded-Port=443、推导/通告的 issuer 丢端口；host 443 映射又须重建 kind 集群。
+# listener 8443 => svc 端口 8443 => X-Forwarded-Port=8443，hub 侧 hostAliases 指 envoy svc
+# ClusterIP 即可直达同一端口。
+#
+# 前置：EG controller 已装（本目录 envoy-gateway-helm-v1.6.1.tgz）、cert-create.sh 已建
+#       console-ingress-tls（https listener 证书）。
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: sdp-eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: sdp-eg
+    namespace: sdp-workflow
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: sdp-eg
+  namespace: sdp-workflow
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        container:
+          # 数据面镜像走本地 registry（deploy-local.sh 预推）。仅换 registry 不换版本：
+          # EG v1.6.1 出厂配 Envoy distroless-v1.36.x（官方兼容矩阵 v1.6 ↔ v1.36）。
+          image: localhost:5000/envoyproxy/envoy:distroless-v1.36.4
+      envoyService:
+        type: NodePort
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: sdp-gateway
+  namespace: sdp-workflow
+spec:
+  gatewayClassName: sdp-eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      # 8443 而非 443：与浏览器访问端口/issuer 端口三方一致（见文件头裁定注释）
+      port: 8443
+      hostname: www.sdpworkflow.com
+      tls:
+        certificateRefs:
+          - kind: Secret
+            name: console-ingress-tls
+      allowedRoutes:
+        namespaces:
+          from: Same

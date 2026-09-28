@@ -1,0 +1,24 @@
+# 本地脚手架（归 local-kind-dev/deploy/，software-distribution-platform-env 仓，**不随三仓打包**）：kind 单节点集群定义。
+# 三个项目仓独立于此 —— 集群/registry/端口映射都是本地测试基础设施。
+# - 主机 8082 -> 节点 30081：Envoy Gateway http（envoy svc NodePort，deploy-local.sh patch 固定）。
+# - 主机 8443 -> 节点 30443：Envoy Gateway https（console/keycloak 走 Gateway API 路由；
+#   curl -k --resolve www.sdpworkflow.com:8443:127.0.0.1 https://www.sdpworkflow.com:8443 可达）。
+# - containerd mirror：集群内引用 localhost:5000/<img> 的镜像自动回源到
+#   跑在 kind docker 网络里的 kind-registry（主机 docker push localhost:5000/...）。
+# 端口与同目录 gateway-sdp.yaml 的 EnvoyProxy/NodePort 语义成对，改一处须同步另一处。
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: sdp-dev
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30081
+        hostPort: 8082
+        protocol: TCP
+      - containerPort: 30443
+        hostPort: 8443
+        protocol: TCP
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]
+      endpoint = ["http://kind-registry:5000"]
