@@ -42,7 +42,7 @@
 
 在 k8s 中 helm 部署
 - envoy gateway（chart 本地 vendor 或从 registry 拉）
-- harbor（规划中：集群内 registry，已纳入 `cert-create.sh` 组件列表，证书名为 `harbor-tls`）
+- harbor（已落地：集群内 registry，由 `local-kind-dev/deploy-local.sh` 核心步骤安装——harbor 先行于平台组件（脚本 harbor 段）；已纳入 `cert-create.sh` 组件列表，证书名为 `harbor-tls`）
 - keycloak（已集成到 hub chart，随 hub 安装）
 - cert-manager：**不安装**，证书自导入
 

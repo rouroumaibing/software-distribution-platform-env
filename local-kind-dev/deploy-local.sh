@@ -1,22 +1,30 @@
 #!/bin/bash
-# deploy-local.sh —— 本地一键部署三组件（临时脚本，本地联调用）。
-# 完整走交付形态：镜像(localhost:5000) + chart(helm) —— 与目标环境部署路径一致。
-# 流程: registry -> kind 集群 -> 镜像(缺才构建) -> postgres -> envoy-gateway -> helm hub/runner/console
+# deploy-local.sh —— 本地一键部署（local-kind-dev 脚手架）。
+#
+# 任务逻辑（与 kind 生产形态对齐：先周边服务，后组件）：
+#   1) 本地 registry（localhost:5000）—— 仅作 harbor 自身镜像 + envoy 数据面镜像的 bootstrap 中转；
+#      任何平台 pod 都不从它拉镜像（平台镜像统一走 harbor）。
+#   2) kind 集群（sdp-dev）。
+#   3) 周边服务先行：先装 harbor（集群内镜像仓库，经 Envoy 网关暴露为 https://harbor.sdpworkflow.com 标准 443），
+#      再装 envoy-gateway 控制面 + 平台网关 sdp-gateway。
+#   4) 构建三组件镜像（build.sh 只负责构建镜像 + docker save），推送统一由本脚本经集群节点 containerd 推到 harbor（见 #4 段 node_push_to_harbor 循环）。
+#   5) postgres / keycloak / hub / runner / console 全部从 harbor 拉镜像部署。
+#
+# 端口约定：所有「域名访问」走标准 443（https://harbor.sdpworkflow.com、https://www.sdpworkflow.com:8443）。
+#   网关数据面均为 ClusterIP（不写死端口）；宿主访问统一由本脚本起 kubectl port-forward 暴露，
+#   端口号不进任何域名/镜像引用：
+#   - sdp-gateway：port-forward 本地 8443 -> svc 8443（https listener 8443，与 issuer/浏览器端口三方一致，
+#     2026-09-23 裁定）、8082 -> svc 80（http）；curl 用 --resolve www.sdpworkflow.com:8443:127.0.0.1。
+#   - harbor-gateway：sudo port-forward 宿主 443 -> svc 443（仅供宿主 docker push / 浏览器）；
+#     节点拉镜像不经此转发——节点在集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到 harbor 网关 ClusterIP
+#     直达 harbor（与生产「节点经 Gateway 域名拉镜像」一致），不写任何 IP、不依赖宿主进程。
+#
 # 用法: ./deploy-local.sh [version]    默认 v0.0.1（需与 build.sh 构建出的版本一致）
-#       ./deploy-local.sh stop         历史兼容空操作（console 已改 ingress 访问）
-# 说明:
-#   - postgres 沿用 P0 manifests（charts 不含 postgres，属于外部依赖，同 old 的 mysql 定位）。
-#   - console 走 ClusterIP + ingress（不再 NodePort），访问 https://localhost:8443（curl -k）。
-#   - 现有 P0 的 hub/runner（裸 manifests 装的）会被删除换成 helm 管理；PVC 一并重建
-#     （本地测试无制品数据，损失可忽略）。
-#   - 幂等：helm upgrade --install，可重复执行。
-#   - 构建日志落工作区根 .logs/build-<comp>.log（失败时打印日志尾部并中止，见步骤 4）；
-#     该目录由 ./clean-local.sh 回收。
+#       ./deploy-local.sh stop         历史兼容空操作
+# 前置约束见同目录 README.md（宿主机 /etc/hosts、docker insecure-registries、kind 重建等）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# 脚本位于 software-distribution-platform-env/local-kind-dev/；工作区根（hub/runner/console 同级）在 SCRIPT_DIR 上两级（ROOT）。
-# 本地测试基础设施（gateway-sdp.yaml / kind.yaml / envoy-gateway-helm tgz）与本脚本同在 local-kind-dev/deploy/，用 $SCRIPT_DIR 引用。
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERSION="${1:-v0.0.1}"
 KUBECONFIG="$ROOT/.kubeconfig"; export KUBECONFIG
@@ -27,53 +35,69 @@ command -v "$KIND" >/dev/null || KIND="$HOME/.workbuddy/binaries/bin/kind"
 HUB_DIR="$ROOT/software-distribution-platform-hub"
 RUNNER_DIR="$ROOT/software-distribution-platform-runner"
 CONSOLE_DIR="$ROOT/software-distribution-platform-console"
-TOKEN="sdp-dev-token-2026"
+ENV_DIR="$ROOT/software-distribution-platform-env"
+HARBOR_DIR="$ENV_DIR/harbor"
 NS="sdp-workflow"
 
+# 域名（基础域名单一真源；均可被环境变量覆盖，默认 sdpworkflow.com）
+#   SDP_BASE_DOMAIN 派生 harbor.<base> 与 www.<base> 两个子域名；
+#   证书 SAN=*.<base> 由 cert-build 据 DOMAINNAME 生成，须与二者保持一致。
+SDP_BASE_DOMAIN="${SDP_BASE_DOMAIN:-sdpworkflow.com}"
+HARBOR_REGISTRY="${HARBOR_REGISTRY:-harbor.${SDP_BASE_DOMAIN}}"
+SDP_GATEWAY_DOMAIN="${SDP_GATEWAY_DOMAIN:-www.${SDP_BASE_DOMAIN}}"
+HARBOR_PROJECT="${HARBOR_PROJECT:-sdp}"
+HARBOR_USER="${HARBOR_USER:-admin}"
+HARBOR_PASS="${HARBOR_PASS:-Admin@123}"
+
+TOKEN="sdp-dev-token-2026"
 log() { echo "[deploy] $*"; }
 
-# 0. stop 子命令（历史兼容：console 已改 ingress 访问，无需停 port-forward）
+# 0. stop 子命令（历史兼容空操作：网关经 port-forward 暴露，停转发请用 stop-dev.sh kill）
 if [ "${1:-}" = "stop" ]; then
-    echo "console 已改为 ingress 访问（https://localhost:8443），无需 stop。"
+    echo "网关经 kubectl port-forward 暴露（sdp 8443 + harbor sudo 443），停止转发请运行: ./stop-dev.sh kill"
     exit 0
 fi
 
-# 1. helm（单文件二进制，缺失则下载到 workspace .bin/）
-ARCH="$(uname -m)"; [ "$ARCH" = "arm64" ] && HARCH="arm64" || HARCH="amd64"
-if command -v helm >/dev/null; then
-    HELM="helm"
-else
-    HELM="$ROOT/.bin/helm"
-    if [ ! -x "$HELM" ]; then
-        log "downloading helm v3.14.4..."
-        mkdir -p "$ROOT/.bin"
-        curl -fsSL "https://get.helm.sh/helm-v3.14.4-darwin-${HARCH}.tar.gz" \
-            | tar -xz -C "$ROOT/.bin" --strip-components=1 "darwin-${HARCH}/helm"
+# ---------- 工具函数 ----------
+# 确保 helm（单文件二进制，缺失则下载到 workspace .bin/）
+ensure_helm() {
+    ARCH="$(uname -m)"; [ "$ARCH" = "arm64" ] && HARCH="arm64" || HARCH="amd64"
+    if command -v helm >/dev/null; then HELM="helm"
+    else
+        HELM="$ROOT/.bin/helm"
+        if [ ! -x "$HELM" ]; then
+            log "downloading helm v3.14.4..."
+            mkdir -p "$ROOT/.bin"
+            curl -fsSL "https://get.helm.sh/helm-v3.14.4-darwin-${HARCH}.tar.gz" \
+                | tar -xz -C "$ROOT/.bin" --strip-components=1 "darwin-${HARCH}/helm"
+        fi
     fi
-fi
-log "helm ready: $("$HELM" version --short 2>/dev/null || echo 'downloaded')"
+    log "helm ready: $("$HELM" version --short 2>/dev/null || echo 'downloaded')"
+}
 
-# 2. registry（跑在 kind docker 网络里，节点经 mirror 访问，主机经 127.0.0.1:5000 push）
-docker network create kind 2>/dev/null || true
-docker inspect kind-registry >/dev/null 2>&1 || \
-    docker run -d --restart=always --name kind-registry --network kind \
-        -p 127.0.0.1:5000:5000 registry:2
-log "registry ready (127.0.0.1:5000)"
+# 确保本地已有某镜像：存在则跳过，不存在才拉取（避免盲目重拉 / 网络失败时尽早暴露）
+ensure_image() {
+    local img="$1"
+    if docker image inspect "$img" >/dev/null 2>&1; then
+        log "image exists, skip pull: $img"
+    else
+        log "pulling $img ..."
+        docker pull -q "$img" >/dev/null || { log "WARN: pull $img failed"; return 1; }
+    fi
+}
 
-# 3. kind 集群（幂等）+ 清节点代理 + IP 防漂移
-#    背景：apiserver 证书 SAN、kubelet.conf、etcd 监听地址都是 kubeadm 在创建时
-#    写死的节点 IP，Docker Desktop 重启后若给节点容器重新分配 IP，集群即瘫痪。
-#    对策双保险：
-#    a) 预防 —— 集群就绪后把节点/registry 容器的当前 IP 固化为静态
-#       （docker 端点记录静态 IP，守护进程重启后不会漂移）。
-#    b) 自愈 —— 节点 NotReady 时先尝试把 IP 修回证书期望值（读
-#       /etc/kubernetes/kubelet.conf 里的 server 地址）并重启节点内组件；
-#       修不好再重建集群（本地 dev 数据可弃，helm 会全量重装）。
-#    注意：新建集群 control-plane 需 ~30s 才 Ready，先宽限 90s 再判死，避免误重建。
-"$KIND" get clusters 2>/dev/null | grep -qx sdp-dev || "$KIND" create cluster --config "$SCRIPT_DIR/deploy/kind.yaml"
-"$KIND" export kubeconfig --name sdp-dev
+# 本地 registry（跑在 kind docker 网络里，仅作 harbor/envoy bootstrap 中转；节点经 mirror 访问）
+ensure_registry() {
+    docker network create kind 2>/dev/null || true
+    ensure_image "registry:2" || log "WARN: 未能预拉 registry:2，docker run 将尝试自行拉取"
+    docker inspect kind-registry >/dev/null 2>&1 || \
+        docker run -d --restart=always --name kind-registry --network kind \
+            -p 127.0.0.1:5000:5000 registry:2
+    log "registry ready (127.0.0.1:5000, bootstrap-only)"
+}
+
+# kind 集群（幂等）+ 清节点代理 + IP 防漂移
 NODE="sdp-dev-control-plane"
-
 wait_node_ready() {   # $1 = 轮询次数（5s/次）
     for _ in $(seq 1 "${1:-18}"); do
         [ "$(kubectl get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ] && return 0
@@ -81,24 +105,20 @@ wait_node_ready() {   # $1 = 轮询次数（5s/次）
     done
     return 1
 }
-
-pin_static_ip() {     # 把容器当前 IP 固化为静态，防 Docker 重启后漂移（幂等）
+pin_static_ip() {
     local c="$1" ip
     ip=$(docker inspect "$c" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
     [ -n "$ip" ] || return 0
     docker network disconnect kind "$c" >/dev/null 2>&1
     docker network connect --ip "$ip" kind "$c" >/dev/null 2>&1
 }
-
-repair_node_ip() {    # 尝试把节点 IP 修回证书写死的期望值
+repair_node_ip() {
     local want now
     want=$(docker exec "$NODE" bash -c \
         "grep -oE 'https://[0-9.]+:6443' /etc/kubernetes/kubelet.conf | head -1 | sed -E 's|https://||;s|:6443||'" 2>/dev/null || true)
     [ -n "$want" ] || return 1
     now=$(docker inspect "$NODE" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
-    if [ "$now" = "$want" ]; then
-        return 1   # IP 本来就对，问题在别处，交给重建兜底
-    fi
+    if [ "$now" = "$want" ]; then return 1; fi
     log "node IP drifted: $now -> expect $want, re-pinning..."
     docker network disconnect kind "$NODE" >/dev/null 2>&1
     docker network connect --ip "$want" kind "$NODE" >/dev/null 2>&1
@@ -107,77 +127,198 @@ repair_node_ip() {    # 尝试把节点 IP 修回证书写死的期望值
     wait_node_ready 24 && { log "node repaired (IP re-pinned to $want)"; return 0; }
     return 1
 }
-
-if ! wait_node_ready 18; then
-    if ! repair_node_ip; then
-        log "node NotReady, recreating cluster..."
-        "$KIND" delete cluster --name sdp-dev
-        "$KIND" create cluster --config "$SCRIPT_DIR/deploy/kind.yaml"
-        "$KIND" export kubeconfig --name sdp-dev
-        wait_node_ready 18 || { log "FATAL: cluster still not ready after recreate"; exit 1; }
-    fi
-fi
-pin_static_ip "$NODE"; pin_static_ip "kind-registry"
-docker exec "$NODE" bash -c "systemctl set-environment HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= NO_PROXY='*' no_proxy='*' && systemctl restart containerd" || true
-sleep 3
-log "kind cluster sdp-dev ready"
-
-# 4. 镜像：本地有就直接推，没有才调 build.sh 构建（build.sh 自带 push）
-#    构建日志落工作区根 .logs/（随 ./clean-local.sh 回收）。**失败必须可见**：只把输出重定向
-#    到文件会让 set -e 静默退出、屏幕上没有任何线索（旧行为写 /tmp 且无提示）。
-BUILD_LOG_DIR="$ROOT/.logs"
-mkdir -p "$BUILD_LOG_DIR"
-for comp in hub runner console; do
-    mod_dir="$ROOT/software-distribution-platform-${comp}"
-    img="localhost:5000/software-distribution-platform-${comp}:${VERSION}"
-    if docker image inspect "$img" >/dev/null 2>&1; then
-        docker push -q "$img" >/dev/null && log "image pushed: $img"
-    else
-        log "image missing, building: $comp (this may take a few minutes)"
-        blog="$BUILD_LOG_DIR/build-${comp}.log"
-        if ! "$mod_dir/build/${comp}/build.sh" "$VERSION" >"$blog" 2>&1; then
-            log "FATAL: ${comp} 构建失败，日志尾部如下（完整日志: ${blog}）:"
-            tail -n 30 "$blog" | sed 's/^/    | /' >&2
-            exit 1
+ensure_kind() {
+    "$KIND" get clusters 2>/dev/null | grep -qx sdp-dev || "$KIND" create cluster --config "$SCRIPT_DIR/deploy/kind.yaml"
+    "$KIND" export kubeconfig --name sdp-dev
+    if ! wait_node_ready 18; then
+        if ! repair_node_ip; then
+            log "node NotReady, recreating cluster..."
+            "$KIND" delete cluster --name sdp-dev
+            "$KIND" create cluster --config "$SCRIPT_DIR/deploy/kind.yaml"
+            "$KIND" export kubeconfig --name sdp-dev
+            wait_node_ready 18 || { log "FATAL: cluster still not ready after recreate"; exit 1; }
         fi
-        log "${comp} built ok (log: $blog)"
     fi
-done
-# postgres 走本地 registry（节点拉不了 docker.io）
-docker inspect "localhost:5000/postgres:16-alpine" >/dev/null 2>&1 || {
-    docker pull -q postgres:16-alpine >/dev/null
-    docker tag postgres:16-alpine "localhost:5000/postgres:16-alpine"
+    pin_static_ip "$NODE"; pin_static_ip "kind-registry"
+    # 节点侧：清代理 + 重启 containerd，使 harbor mirror + /etc/hosts 生效
+    docker exec "$NODE" bash -c "systemctl set-environment HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= NO_PROXY='*' no_proxy='*' && systemctl restart containerd" || true
+    sleep 3
+    log "kind cluster sdp-dev ready"
 }
-docker push -q "localhost:5000/postgres:16-alpine" >/dev/null
-# Envoy Gateway 走本地 registry（控制面 + 数据面镜像，kind 节点拉不了 docker.io；
-# 版本见 hub chart values frontGateway.envoyImage 注释：EG v1.6.1 ↔ Envoy distroless-v1.36.x）
-for img in "docker.io/envoyproxy/gateway:v1.6.1 localhost:5000/envoyproxy/gateway:v1.6.1" \
-           "docker.io/envoyproxy/envoy:distroless-v1.36.4 localhost:5000/envoyproxy/envoy:distroless-v1.36.4"; do
-    src=${img%% *}; dst=${img##* }
+
+# 节点经集群 DNS（CoreDNS）把 ${HARBOR_REGISTRY} 解析到 harbor 网关 ClusterIP，
+# 与生产「节点经 Gateway 域名拉镜像」完全一致：不写任何 IP、不依赖宿主进程。
+# 实现（须在 harbor 网关 EnvoyProxy/数据面 svc 已存在、可取其集群 DNS 名之后调用）：
+#   ① patch kube-system/coredns，注入 rewrite name ${HARBOR_REGISTRY} -> 网关 svc 集群 DNS 名并重启 coredns；
+#   ② 节点 /etc/resolv.conf 前置 CoreDNS（kube-dns 默认 10.96.0.10）；
+#   ③ 节点 /etc/hosts 清除任何 harbor 行（避免陈旧 IP 覆盖 DNS）；④ 重启 containerd 生效。
+patch_coredns_rewrite() {
+    local dns="$1" cm newcm
+    cm=$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)
+    [ -n "$cm" ] || { log "WARN: 读取 coredns Corefile 失败，跳过 rewrite 注入"; return 1; }
+    if echo "$cm" | grep -q "rewrite name ${HARBOR_REGISTRY} $dns"; then
+        log "coredns rewrite 已存在 ($dns)"
+        return 0
+    fi
+    # 在 '    ready' 行后插入 rewrite（4 空格缩进，与 Corefile 一致）；通过 stdin 注入新 Corefile。
+    newcm=$(printf '%s\n' "$cm" | awk -v dns="$dns" '{print} /^    ready$/ {print "    rewrite name ${HARBOR_REGISTRY} " dns}')
+    printf '%s\n' "$newcm" \
+        | kubectl -n kube-system create cm coredns --from-file=Corefile=/dev/stdin --dry-run=client -o yaml 2>/dev/null \
+        | kubectl apply -f - 2>/dev/null \
+        || { log "WARN: 注入 coredns rewrite 失败（节点可能无法经 DNS 解析 harbor，将影响镜像拉取）"; return 1; }
+    kubectl -n kube-system rollout restart deployment/coredns 2>/dev/null
+    kubectl -n kube-system rollout status deployment/coredns --timeout=120s 2>/dev/null || true
+    log "coredns rewrite 注入 -> $dns，coredns 已重启"
+}
+ensure_node_dns_harbor() {
+    local dns="$1"
+    [ -n "$dns" ] || { log "WARN: ensure_node_dns_harbor 未收到网关 svc 集群 DNS 名，跳过节点 DNS 更新"; return 1; }
+    patch_coredns_rewrite "$dns"
+    # ② 节点 /etc/resolv.conf 前置 CoreDNS（已前置则跳过，避免重复）
+    docker exec "$NODE" bash -c "grep -q '^nameserver 10.96.0.10' /etc/resolv.conf || sed -i '1i nameserver 10.96.0.10' /etc/resolv.conf" 2>/dev/null || true
+    # ③ 节点 /etc/hosts 清除 harbor 行（grep -v 写临时文件再覆盖，规避 overlay rename 限制）
+    docker exec "$NODE" sh -c "grep -v '${HARBOR_REGISTRY}' /etc/hosts > /tmp/hosts.sdp 2>/dev/null && cat /tmp/hosts.sdp > /etc/hosts" 2>/dev/null || true
+    # ④ 重启 containerd 使 mirror + DNS 生效
+    docker exec "$NODE" bash -c "systemctl restart containerd" 2>/dev/null || true
+    log "node DNS: ${HARBOR_REGISTRY} -> $dns (via CoreDNS rewrite)，containerd 已重启"
+}
+
+# 宿主机 /etc/hosts（docker push / 浏览器访问用；需要 sudo，失败仅告警）
+ensure_host_hosts() {
+    local entry
+    for entry in "127.0.0.1 ${HARBOR_REGISTRY}" "127.0.0.1 ${SDP_GATEWAY_DOMAIN}"; do
+        if ! grep -q "$entry" /etc/hosts 2>/dev/null; then
+            if sudo sh -c "echo '$entry' >> /etc/hosts" 2>/dev/null; then
+                log "host /etc/hosts appended: $entry"
+            else
+                log "WARN: 未能写入 host /etc/hosts（$entry）—— 请手工添加，否则 docker push / 浏览器访问 ${HARBOR_REGISTRY} 失败"
+            fi
+        fi
+    done
+}
+
+# harbor HTTP API（经集群节点访问：节点经 CoreDNS 把 harbor.sdpworkflow.com 解析到网关 ClusterIP
+# 直达 harbor，不依赖宿主端口转发 / sudo，与生产「节点经 Gateway 域名访问」一致；harbor_status 仅取 HTTP 状态码）。
+harbor_api() { docker exec "$NODE" curl -s -k -u "${HARBOR_USER}:${HARBOR_PASS}" "$@"; }
+harbor_status() { docker exec "$NODE" curl -s -k -o /dev/null -u "${HARBOR_USER}:${HARBOR_PASS}" -w '%{http_code}' "$@"; }
+ensure_harbor_project() {
+    local code body exists
+    body=$(harbor_api "https://${HARBOR_REGISTRY}/api/v2.0/projects?name=${HARBOR_PROJECT}" 2>/dev/null || true)
+    code=$(harbor_status "https://${HARBOR_REGISTRY}/api/v2.0/projects?name=${HARBOR_PROJECT}" 2>/dev/null || echo 000)
+    exists=$(printf '%s' "$body" | grep -c "\"name\":\"${HARBOR_PROJECT}\"" || true)
+    if [ "${exists:-0}" -gt 0 ]; then
+        log "harbor project '$HARBOR_PROJECT' exists"
+        return 0
+    fi
+    if [ "$code" != "200" ] && [ "$code" != "201" ]; then
+        log "FATAL: 查询 harbor project 失败 (HTTP $code) —— harbor 不可达或非 admin 凭据，终止部署"
+        exit 1
+    fi
+    # 未找到 -> 创建
+    log "creating harbor project '$HARBOR_PROJECT' ..."
+    code=$(harbor_status -X POST "https://${HARBOR_REGISTRY}/api/v2.0/projects" \
+        -H "Content-Type: application/json" \
+        -d "{\"project_name\":\"${HARBOR_PROJECT}\",\"public\":true}" 2>/dev/null || echo 000)
+    if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+        log "harbor project '$HARBOR_PROJECT' created (HTTP $code)"
+    else
+        log "FATAL: 创建 harbor project '$HARBOR_PROJECT' 失败 (HTTP $code) —— 镜像推送将全部失败，终止部署"
+        exit 1
+    fi
+}
+# 把「宿主已有的镜像」经集群节点 containerd 推到 harbor（与生产访问逻辑一致：节点在集群内经
+# 网关域名 / 内部服务直达 harbor，不依赖宿主进程、不写死端口）。
+#   背景：宿主 docker push harbor.sdpworkflow.com 在 macOS Docker Desktop 下因 daemon 跑在独立 VM、
+#   无法访问宿主 loopback 的 port-forward 443 而失败；因此把镜像灌入节点 containerd，由节点经
+#   harbor 内部服务（harbor.harbor.svc.cluster.local:80，无 TLS）推送。
+#   - 宿主 docker save | 节点 ctr import 注入节点（自定义构建镜像 / 已拉取到宿主的上游镜像均适用）；
+#   - 节点 ctr tag -> harbor 内部仓库路径，ctr push --platform linux/amd64 --plain-http --skip-verify。
+#   参数 $1 = 宿主镜像引用（postgres:16-alpine / quay.io/keycloak/keycloak:26.7.4 /
+#         software-distribution-platform-hub:v0.0.1）；目标 = harbor.sdpworkflow.com/${HARBOR_PROJECT}/<basename>。
+node_push_to_harbor() {
+    local src="$1" srcnode name tag harborgw
+    [ -n "$src" ] || { log "WARN: node_push_to_harbor 空参数"; return 1; }
+    # 派生 harbor 仓库名 / tag（取最后一个 / 之后的 basename，再按 : 拆 tag）
+    local b="${src##*/}"; tag="${b##*:}"; name="${b%:*}"
+    harborgw="harbor.harbor.svc.cluster.local/${HARBOR_PROJECT}/${name}:${tag}"
+    log "node-push: $src -> $harborgw (经节点 containerd)"
+    # 宿主 save | 节点 import（多架构 index 可能报 missing blob，但 amd64 manifest 已就绪，忽略非零）
+    docker save "$src" 2>/dev/null | docker exec -i "$NODE" ctr -n k8s.io images import - >/dev/null 2>&1 || true
+    # 节点侧按 basename:tag 定位真实 ref（docker save/ctr import 会给无 registry 的本地镜像补 docker.io/library/ 前缀）
+    srcnode=$(docker exec "$NODE" ctr -n k8s.io images ls 2>/dev/null | awk -v b="${name}:${tag}" '$1 ~ b {print $1; exit}')
+    [ -n "$srcnode" ] || { log "WARN: 源镜像未在节点找到: ${name}:${tag}"; return 1; }
+    docker exec "$NODE" ctr -n k8s.io images tag --force "$srcnode" "$harborgw" >/dev/null 2>&1 \
+        || { log "WARN: 节点 tag 失败: $harborgw"; return 1; }
+    # 推 amd64（单架构镜像直接选唯一 manifest；多架构 index 选 amd64，避免缺 blob）；
+    # 失败回退一次不带 --platform（个别单架构镜像对 --platform 报错时兜底）。
+    if docker exec "$NODE" ctr -n k8s.io images push --platform linux/amd64 --skip-verify --plain-http \
+            --user "${HARBOR_USER}:${HARBOR_PASS}" "$harborgw" >/dev/null 2>&1; then
+        log "pushed ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${name}:${tag} (via node, amd64)"
+    elif docker exec "$NODE" ctr -n k8s.io images push --skip-verify --plain-http \
+            --user "${HARBOR_USER}:${HARBOR_PASS}" "$harborgw" >/dev/null 2>&1; then
+        log "pushed ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${name}:${tag} (via node)"
+    else
+        log "WARN: 节点推 harbor 失败: $harborgw（可能 harbor 未就绪 / 凭据错）"
+        return 1
+    fi
+}
+
+# 把源镜像推到 harbor 的 $HARBOR_PROJECT 项目（tag=basename）。
+#   宿主缺失则先拉取（存在则跳过），避免盲目重拉 / 网络失败时尽早暴露；统一经节点推送（见 node_push_to_harbor）。
+push_image_to_harbor() {
+    local src="$1"
+    ensure_image "$src" || { log "WARN: 源镜像 $src 缺失且拉取失败，skip push"; return 1; }
+    node_push_to_harbor "$src"
+}
+
+# 把镜像推到本地 registry（仅 bootstrap：envoy + harbor 自身镜像；节点直拉 docker.io 被代理挡死）
+push_to_local_registry() {
+    local src="$1" dst="$2"
     if ! docker image inspect "$dst" >/dev/null 2>&1; then
-        docker pull -q "$src" >/dev/null || { log "WARN: pull $src failed, envoy-gateway may not work"; continue; }
+        docker image inspect "$src" >/dev/null 2>&1 || docker pull -q "$src" >/dev/null \
+            || { log "WARN: pull $src failed"; return 1; }
         docker tag "$src" "$dst"
     fi
-    docker push -q "$dst" >/dev/null
-done
-# keycloak 也走本地 registry（kind 节点直拉 quay.io 实测 6 分钟不完成；版本与 hub chart values 成对）
-if ! docker image inspect "localhost:5000/keycloak/keycloak:26.7.4" >/dev/null 2>&1; then
-    docker pull -q quay.io/keycloak/keycloak:26.7.4 >/dev/null || log "WARN: pull keycloak image failed"
-    docker tag quay.io/keycloak/keycloak:26.7.4 "localhost:5000/keycloak/keycloak:26.7.4"
+    docker push -q "$dst" >/dev/null || { log "WARN: push $dst failed"; return 1; }
+    log "bootstrap image ready: $dst"
+}
+
+# ---------- 主流程 ----------
+ensure_helm
+ensure_registry
+ensure_kind
+ensure_host_hosts
+
+CERT_SCRIPT_SRC="$ENV_DIR/cert-build/cert-create.sh"
+
+# 证书（自签兜底，SAN *.${SDP_BASE_DOMAIN} 覆盖 harbor/console/hub）：先确保 harbor 证书文件存在，
+# 供 harbor-tls secret 使用；console/hub 的 TLS secret 沿用下方 #6.5 既有逻辑。
+if [ ! -f "$ENV_DIR/cert-build/certs/harbor.crt" ] || [ ! -f "$ENV_DIR/cert-build/certs/harbor.key" ]; then
+    log "生成自签证书（SAN *.${SDP_BASE_DOMAIN} 覆盖 harbor/console/hub）..."
+    DOMAINNAME="${SDP_BASE_DOMAIN}" NAMESPACE="$NS" bash "$CERT_SCRIPT_SRC"
 fi
-docker push -q "localhost:5000/keycloak/keycloak:26.7.4" >/dev/null
-log "images ready"
 
-# 5. 命名空间 + postgres（外部依赖，沿用 P0 manifests）
-kubectl apply -f "$HUB_DIR/deploy/manifests/00-namespace.yaml"
-kubectl apply -f "$HUB_DIR/deploy/manifests/10-postgres.yaml"
-kubectl -n "$NS" rollout status deploy/postgres --timeout=180s
-log "postgres ready"
+# 1. 预推 bootstrap 镜像到本地 registry（envoy 控制面/数据面 + harbor 自身 bitnamilegacy）。
+#    这些镜像不能依赖 harbor（harbor 自身 / harbor 网关的 envoy 数据面都还没起来），必须走 localhost:5000。
+log "预推 bootstrap 镜像到 localhost:5000 ..."
+push_to_local_registry "docker.io/envoyproxy/gateway:v1.6.1" "localhost:5000/envoyproxy/gateway:v1.6.1" || true
+push_to_local_registry "docker.io/envoyproxy/envoy:distroless-v1.36.4" "localhost:5000/envoyproxy/envoy:distroless-v1.36.4" || true
+if [ -f "$HARBOR_DIR/harbor-27.0.3.tgz" ]; then
+    # 用 pipe->while read 逐行处理（避免 $HARBOR_IMGS 裸展开做字段切分，镜像名若含括号等
+    # shell 元字符会触发 "unexpected token ')'" 语法错误）。
+    "$HELM" template harbor "$HARBOR_DIR/harbor-27.0.3.tgz" -f "$HARBOR_DIR/values.yaml" \
+        | sed -nE 's/^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+)"?$/\1/p' \
+        | sort -u \
+        | while IFS= read -r img; do
+              [ -n "$img" ] || continue
+              push_to_local_registry "docker.io/${img#localhost:5000/}" "$img" || true
+          done
+else
+    log "WARN: 缺少 $HARBOR_DIR/harbor-27.0.3.tgz，harbor 安装将失败"
+fi
+log "bootstrap images ready"
 
-# 5.5. Envoy Gateway controller（平台统一入口的网关控制面；ingress-nginx 已废弃）。
-#      chart tgz 在 local-kind-dev/deploy/（本地脚手架，不随仓分发），crds/ 内含 Gateway API + EG CRDs，
-#      先于项目 chart 安装，hub/console chart 的 Gateway API 资源才能 apply。
-#      数据面（envoy proxy pod）镜像已在 #4 预推本地 registry；具体引用见 local-kind-dev/deploy/gateway-sdp.yaml。
+# 2. Envoy Gateway 控制面（先于任何 Gateway/EnvoyProxy 资源）
 if ! kubectl get ns envoy-gateway-system >/dev/null 2>&1; then
     log "installing envoy-gateway controller..."
     "$HELM" install eg "$SCRIPT_DIR/deploy/envoy-gateway-helm-v1.6.1.tgz" \
@@ -185,185 +326,261 @@ if ! kubectl get ns envoy-gateway-system >/dev/null 2>&1; then
         --set config.envoyGateway.gateway.controllerName=gateway.envoyproxy.io/gatewayclass-controller
 fi
 kubectl -n envoy-gateway-system rollout status deploy/envoy-gateway --timeout=300s
-log "envoy-gateway controller ready (gatewayapi CRDs + EG CRDs installed)"
+log "envoy-gateway controller ready"
 
-# 6. 清理 P0 裸 manifests 装的旧资源（换成 helm 管理；同名资源未被 helm 管理会冲突）
+# 3. Harbor 先行（集群内镜像仓库；ns harbor）。
+#    幂等：已安装也走 upgrade --install，确保 values.yaml 变更（如镜像地址从 docker.io 前缀修正为
+#    localhost:5000）生效，便于重复运行自愈；首装/重装都走同一路径。
+kubectl create ns harbor --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+if ! kubectl -n harbor get secret harbor-tls >/dev/null 2>&1; then
+    kubectl -n harbor create secret tls harbor-tls \
+        --cert="$ENV_DIR/cert-build/certs/harbor.crt" \
+        --key="$ENV_DIR/cert-build/certs/harbor.key"
+fi
+"$HELM" upgrade --install harbor "$HARBOR_DIR/harbor-27.0.3.tgz" -n harbor -f "$HARBOR_DIR/values.yaml"
+if ! kubectl -n harbor wait --for=condition=ready pod -l app.kubernetes.io/name=harbor --timeout=600s 2>/dev/null; then
+    log "WARN: harbor pods 600s 未全部 ready，打印诊断（下一步请据此判断是镜像拉取还是内部依赖）："
+    set +e
+    echo "    | ---- pods 状态 ----"
+    kubectl -n harbor get pods -o wide 2>/dev/null | sed 's/^/    | /'
+    echo "    | ---- 各 pod 拉取/重启原因 ----"
+    kubectl -n harbor get pods -o jsonpath='{range .items[*]}{.metadata.name}{"  phase="}{.status.phase}{"  state="}{.status.containerStatuses[0].state}{"\n"}{end}' 2>/dev/null | sed 's/^/    | /'
+    echo "    | ---- bootstrap registry(localhost:5000) 已入库镜像 ----"
+    curl -s localhost:5000/v2/_catalog 2>/dev/null | sed 's/^/    | /' || echo "    | (无法连接 localhost:5000，bootstrap registry 可能未起)"
+    set -e
+fi
+# harbor 网关（独立 EnvoyProxy harbor-eg，type: ClusterIP：与生产形态一致、零写死端口）。
+# 宿主侧由 sudo kubectl port-forward 443:443 暴露，仅供宿主 docker push / 浏览器访问；
+# 节点拉镜像不经此转发——节点在集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到网关 ClusterIP 直达 harbor。
+kubectl apply -f "$HARBOR_DIR/harbor-gateway.yaml" --validate=false
+# 等待 harbor-gateway 的 envoy 数据面 svc 创建（harbor 未 Ready 时 Gateway 不会 Programmed，svc 不会及时出现）
+HARBOR_ENVOY_NS=""; HARBOR_ENVOY_SVC=""
+for i in $(seq 1 60); do
+    HARBOR_ENVOY_SVC=$(kubectl get svc -A -l gateway.envoyproxy.io/owning-gateway-name=harbor-gateway \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    [ -n "$HARBOR_ENVOY_SVC" ] && break; sleep 5
+done
+HARBOR_ENVOY_NS=$(kubectl get svc -A -l gateway.envoyproxy.io/owning-gateway-name=harbor-gateway \
+    -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null)
+if [ -z "$HARBOR_ENVOY_SVC" ]; then
+    log "FATAL: 未找到 harbor-gateway envoy svc（请检查 EG controller 与 Gateway 状态）"
+    exit 1
+fi
+# 宿主 port-forward 暴露 harbor 443（sudo 绑标准 443，仅供宿主 docker push / 浏览器；
+# 节点侧不依赖此转发，节点经 CoreDNS 解析 harbor.sdpworkflow.com -> 网关 ClusterIP 在集群内直达）。
+sudo kubectl -n "$HARBOR_ENVOY_NS" port-forward --address 0.0.0.0 "svc/$HARBOR_ENVOY_SVC" 443:443 \
+    >/dev/null 2>&1 &
+HARBOR_PF_PID=$!
+disown "$HARBOR_PF_PID" 2>/dev/null || true
+# 等待 port-forward 生效（harbor 健康端点可达）
+for i in $(seq 1 30); do
+    if curl -s -k --resolve "${HARBOR_REGISTRY}:443:127.0.0.1" "https://${HARBOR_REGISTRY}/api/v2.0/health" \
+        >/dev/null 2>&1; then
+        break
+    fi
+    sleep 3
+done
+log "harbor-gateway: 宿主 port-forward 443:443 (pid=$HARBOR_PF_PID, 仅供 docker push/浏览器); 节点经 CoreDNS 解析在集群内直达"
+# 等 harbor 网关就绪（Envoy 数据面 Programmed）后再建项目 / 推镜像
+for i in $(seq 1 30); do
+    [ -n "$(kubectl get gateway harbor-gateway -n harbor -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" ] && break
+    sleep 5
+done
+# 节点侧：CoreDNS rewrite harbor.sdpworkflow.com -> 网关 svc 集群 DNS 名（集群内直达，不写 IP）。
+HARBOR_GW_DNS="${HARBOR_ENVOY_SVC}.${HARBOR_ENVOY_NS}.svc.cluster.local"
+ensure_node_dns_harbor "$HARBOR_GW_DNS"
+ensure_harbor_project
+docker login "${HARBOR_REGISTRY}" -u "${HARBOR_USER}" -p "${HARBOR_PASS}" >/dev/null 2>&1 || true
+# 平台依赖镜像先推 harbor（postgres / keycloak），三个组件镜像稍后由本脚本经节点推（build.sh 只构建不推送）
+push_image_to_harbor "postgres:16-alpine"
+push_image_to_harbor "quay.io/keycloak/keycloak:26.7.4"
+log "harbor ready: https://${HARBOR_REGISTRY} (admin/${HARBOR_PASS})"
+
+# 4. 构建三组件镜像（build.sh 只构建 + docker save，不推送；镜像推送统一见下方 node_push_to_harbor 循环）
+BUILD_LOG_DIR="$ROOT/.logs"; mkdir -p "$BUILD_LOG_DIR"
+for comp in hub runner console; do
+    mod_dir="$ROOT/software-distribution-platform-${comp}"
+    if docker image inspect "software-distribution-platform-${comp}:${VERSION}" >/dev/null 2>&1; then
+        # 镜像已存在（前次构建产物仍在宿主 docker），跳过重建，仅由下方 node_push 循环重新推送；
+        # 若改了源码想强制重构建，先 docker rmi software-distribution-platform-${comp}:${VERSION} 或升版本号。
+        log "image software-distribution-platform-${comp}:${VERSION} present, skip rebuild (re-push via node below)"
+    else
+        log "building ${comp} (this may take a few minutes)"
+        blog="$BUILD_LOG_DIR/build-${comp}.log"
+        if ! ( cd "$mod_dir" && "$mod_dir/build/${comp}/build.sh" "$VERSION" ) >"$blog" 2>&1; then
+            log "FATAL: ${comp} 构建失败，日志尾部如下（完整: ${blog}）:"
+            tail -n 30 "$blog" | sed 's/^/    | /' >&2; exit 1
+        fi
+        log "${comp} built ok (log: $blog)"
+    fi
+done
+# 三组件镜像经节点推 harbor（build.sh 不推送；macOS Docker Desktop 下宿主 daemon 与节点网络隔离，
+# 直接 docker push 到 harbor.sdpworkflow.com:443 会失败，故统一走 node_push_to_harbor，
+# 与生产「节点经 Gateway 域名拉/推镜像」一致）。
+for comp in hub runner console; do
+    node_push_to_harbor "software-distribution-platform-${comp}:${VERSION}" \
+        || log "WARN: 节点推 ${comp} 失败（镜像未进 harbor，后续部署会 ImagePullBackOff）"
+done
+log "component images pushed to harbor (via node)"
+
+# 5. 命名空间 + postgres（外部依赖，沿用 P0 manifests；镜像已推 harbor）
+kubectl apply -f "$HUB_DIR/deploy/manifests/00-namespace.yaml"
+kubectl apply -f "$HUB_DIR/deploy/manifests/10-postgres.yaml"
+kubectl -n "$NS" rollout status deploy/postgres --timeout=180s
+log "postgres ready (image from harbor)"
+
+# 6. 清理 P0 裸 manifests 装的旧资源（换成 helm 管理）
 kubectl -n "$NS" delete deploy/hub deploy/runner svc/hub pvc/hub-artifacts --ignore-not-found
 kubectl -n "$NS" delete sa/sdp-runner --ignore-not-found
 kubectl delete clusterrole/sdp-runner clusterrolebinding/sdp-runner --ignore-not-found
 log "legacy P0 resources removed"
 
-# 6.5 TLS secret 必须先于任何网关路由就位：Gateway https listener
-#     （证书 console-ingress-tls）与 keycloak HTTPRoute 都引用该 secret。
-#     若 secret 尚不存在，Gateway 的 https listener 不会进入 Programmed 状态；
-#     显式前置可去掉这个窗口，也让"证书是共享前置"这件事写在流程里。
-#     TLS secret 的语义（与参考工程 old/go-devops 一致）：
-#       - 生产：由运维**手工**创建 console-tls / console-ingress-tls，chart 只在容器内引用
-#               （console values: cert.secretName / gatewayRoute.caSecretName；gateway 引用见 local-kind-dev/deploy/gateway-sdp.yaml），
-#               部署流程不生成任何私钥；
-#       - 本地：secret 已存在则直接复用；缺失才用统一证书生成器自签兜底
-#               （源在 software-distribution-platform-env/cert-build/cert-create.sh，部署时直接运行源脚本；
-#                临时测试，产物在 env/cert-build/certs），可用 SKIP_GEN_CERTS=1 强制要求已存在。
-#       生成器定位：商用 CA 证书申请前的替代证书（dev/staging 占位），详见 docs/shared/CERTIFICATES.md。
-ENV_DIR="$ROOT/software-distribution-platform-env"
-CERT_SCRIPT_SRC="$ENV_DIR/cert-build/cert-create.sh"
+# 6.5 TLS secret（console-tls / console-ingress-tls）：沿用既有逻辑（console/hub 网关证书），
+#     缺失才用 cert-build 自签兜底；harbor 的 harbor-tls 已在 #3 建好。
 if kubectl -n "$NS" get secret console-tls >/dev/null 2>&1 \
    && kubectl -n "$NS" get secret console-ingress-tls >/dev/null 2>&1; then
     log "TLS secrets present (console-tls / console-ingress-tls), reused"
 elif [ -n "${SKIP_GEN_CERTS:-}" ]; then
-    log "FATAL: 缺少 TLS secret 且 SKIP_GEN_CERTS=1 —— 请先手工创建 console-tls / console-ingress-tls"
+    log "FATAL: 缺少 TLS secret 且 SKIP_GEN_CERTS=1"
     exit 1
 else
-    log "TLS secrets missing -> local self-signed fallback (源 cert-create.sh 直接运行；生产请手工创建)"
-    if [ ! -f "$CERT_SCRIPT_SRC" ]; then
-        log "FATAL: 证书生成器缺失（$CERT_SCRIPT_SRC），无法自签兜底"
-        exit 1
-    fi
+    log "TLS secrets missing -> local self-signed fallback"
     bash "$CERT_SCRIPT_SRC" "$NS"
+    # cert-create.sh 产出的是 generic 类型的 ${component}-server-secret（命名不匹配、且不自动 apply）；
+    # 故此处用 cert-build 生成的 console 证书显式建两个 secret（不改 cert-build 脚本）：
+    # 两个 secret 类型/key 约定不同，见下方各自注记。
+    # console-ingress-tls：网关 https listener 证书，须 kubernetes.io/tls 类型（tls.crt/tls.key）。
+    kubectl -n "$NS" create secret tls console-ingress-tls \
+        --cert="$ENV_DIR/cert-build/certs/console.crt" \
+        --key="$ENV_DIR/cert-build/certs/console.key" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    # console-tls：console 容器挂 /etc/nginx/ssl + BackendTLSPolicy CA 校验用，chart 约定
+    # generic 三 key（ca.crt/server.crt/server.key，见 console chart values.yaml cert 注记）。
+    # 不能建 tls 类型（只有 tls.crt/tls.key），否则 console pod FailedMount 找不到 ca.crt。
+    kubectl -n "$NS" create secret generic console-tls \
+        --from-file=ca.crt="$ENV_DIR/cert-build/certs/ca.crt" \
+        --from-file=server.crt="$ENV_DIR/cert-build/certs/console.crt" \
+        --from-file=server.key="$ENV_DIR/cert-build/certs/console.key" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    log "TLS secrets created (console-ingress-tls tls-type / console-tls generic 3-key) from self-signed certs"
 fi
 
-# 6.6 平台统一入口 Gateway（网关级资源在 local-kind-dev/deploy/gateway-sdp.yaml，不随仓分发）：
-#     GatewayClass + EnvoyProxy（数据面镜像/NodePort 语义）+ Gateway（http/https listener，
-#     https 引 console-ingress-tls）。三个项目 chart 的 HTTPRoute 按名字（sdp-gateway）挂接。
-kubectl apply -f "$SCRIPT_DIR/deploy/gateway-sdp.yaml"
-log "gateway sdp-gateway applied (class sdp-eg, http 30081 / https 30443)"
+# 6.6 sdp-ca：hub 挂载 /etc/sdp-ca/ca.crt 信任自签 harbor/keycloak 证书（cert-build 的 CA）。
+#     hub deployment 的 volume sdp-ca 引用 key ca.crt，缺失则 hub pod FailedMount 卡 ContainerCreating。
+if ! kubectl -n "$NS" get secret sdp-ca >/dev/null 2>&1; then
+    kubectl -n "$NS" create secret generic sdp-ca \
+        --from-file=ca.crt="$ENV_DIR/cert-build/certs/ca.crt"
+    log "secret sdp-ca created (ca.crt from cert-build)"
+fi
 
-# 6.7 等 envoy 数据面 svc 就绪 + 固定 NodePort + 抓 ClusterIP —— 必须先于 hub：
-#     hub 的 hostAliases 要用它把 issuer 域名解析到网关。⚠️ EG v1.6 把 proxy svc 建在
-#     **envoy-gateway-system** ns（即使 EnvoyProxy CR 在 sdp-workflow），跨 ns 按标签找；
-#     listener 变更会换 svc 名（hash 后缀）与 ClusterIP，故每次部署都重查。
-ENVOY_SVC_NS=""
-ENVOY_SVC=""
-for i in 1 2 3 4 5 6; do
-    ENVOY_SVC_NS=$(kubectl get svc -A -l gateway.envoyproxy.io/owning-gateway-name=sdp-gateway \
-        -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null)
+# 7. 平台统一入口 Gateway（sdp-gateway，https listener 8443 与 issuer/浏览器端口三方一致）
+#    注：harbor 网关使用独立 GatewayClass harbor-eg（不复用 sdp-eg），故此处无需提前 apply；
+#        此处幂等 apply，再等待其 envoy 数据面 svc 出现并固定 NodePort（与 harbor 段同理）。
+kubectl apply -f "$SCRIPT_DIR/deploy/gateway-sdp.yaml" --validate=false
+# 等待 sdp-gateway 的 envoy 数据面 svc 创建（与 harbor-gateway 同理：Gateway 未 Programmed 前 svc 不出现，
+# 故拉长等待窗口；否则落到随机 NodePort 会与 kind.yaml 的 hostPort 映射错位，导致平台入口不可达）。
+# EG v1.6.1 不支持在 EnvoyProxy 声明 NodePort，只能事后 patch svc。
+ENVOY_SVC_NS=""; ENVOY_SVC=""
+for i in $(seq 1 60); do
     ENVOY_SVC=$(kubectl get svc -A -l gateway.envoyproxy.io/owning-gateway-name=sdp-gateway \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    [ -n "$ENVOY_SVC" ] && break
-    sleep 5
+    [ -n "$ENVOY_SVC" ] && break; sleep 5
 done
+ENVOY_SVC_NS=$(kubectl get svc -A -l gateway.envoyproxy.io/owning-gateway-name=sdp-gateway \
+    -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null)
 if [ -z "$ENVOY_SVC" ]; then
-    log "FATAL: envoy proxy svc 未创建（Gateway 编程失败？）—— 用 egctl x status all -A 排查"
+    log "FATAL: sdp-gateway envoy proxy svc 未创建（请检查 EG controller 与 Gateway 状态）"
     exit 1
 fi
-#     NodePort 与 local-kind-dev/deploy/kind.yaml extraPortMappings 成对：http 30081 / https 30443
-#     （EnvoyProxy CRD 无 nodePorts 字段，只能事后 patch；https listener 端口 = 8443，
-#      与浏览器访问端口/issuer 端口三方一致）。
-for idx in 0 1 2; do
-    port=$(kubectl -n "$ENVOY_SVC_NS" get "svc/$ENVOY_SVC" -o jsonpath="{.spec.ports[$idx].port}" 2>/dev/null) || break
-    case "$port" in
-        80)   kubectl -n "$ENVOY_SVC_NS" patch "svc/$ENVOY_SVC" --type json \
-                  -p "[{\"op\":\"replace\",\"path\":\"/spec/ports/$idx/nodePort\",\"value\":30081}]" >/dev/null ;;
-        8443) kubectl -n "$ENVOY_SVC_NS" patch "svc/$ENVOY_SVC" --type json \
-                  -p "[{\"op\":\"replace\",\"path\":\"/spec/ports/$idx/nodePort\",\"value\":30443}]" >/dev/null ;;
-    esac
+# 宿主 port-forward 暴露 sdp-gateway（ClusterIP，不写死端口）：本地 8443->svc 8443（https）、8082->svc 80（http）。
+# 绑定 127.0.0.1（仅宿主/浏览器经 --resolve 访问；集群内 pod 走 ClusterIP DNS，不经此处）。
+kubectl -n "$ENVOY_SVC_NS" port-forward "svc/$ENVOY_SVC" 8443:8443 8082:80 \
+    >/dev/null 2>&1 &
+disown $! 2>/dev/null || true
+# 等待本地 8443 可用
+for i in $(seq 1 30); do
+    if curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 "https://${SDP_GATEWAY_DOMAIN}:8443/" \
+        >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
 done
 ENVOY_IP=$(kubectl -n "$ENVOY_SVC_NS" get "svc/$ENVOY_SVC" -o jsonpath='{.spec.clusterIP}')
-log "envoy svc ready ($ENVOY_SVC_NS/$ENVOY_SVC clusterIP=$ENVOY_IP, nodePorts http->30081 https->30443)"
-
-# 7. hub（chart 内含 Deployment/PVC/NodePort svc + keycloak 子 chart + keycloak HTTPRoute；
-#    网关级资源在 #6.6 已由根脚手架 apply；console 的 HTTPRoute 在 console chart）
-#
-#    真对接 Keycloak（2026-09-23 起 deploy 默认开启；SKIP_AUTH=1 退回 dev 姿态）：
-#    issuer 三方一致（KC_HOSTNAME / console VITE_KEYCLOAK_ISSUER_URL / hub KEYCLOAK_ISSUER）
-#    钉死为公网 URL，端口 8443 与网关 https listener / 浏览器访问端口对齐。
-#    hub 侧两个 dev-only 脚手架：hostAliases（= envoy svc ClusterIP，pod 内解析对外域名
-#    直达网关；不能指节点 IP——pod 只能达 nodePort 30k 段，URL 的 :8443 会对不上）
-#    + SSL_CERT_FILE（自签 CA）。CREDENTIAL_ENCRYPTION_KEY 用固定 dev 字面量（32 字节），
-#    由 chart 持久化 —— 之前 kubectl set env 的手动注入会被 helm upgrade 抹掉（真踩过）。
-ISSUER="https://www.sdpworkflow.com:8443/keycloak/realms/sdp"
+log "envoy svc ready ($ENVOY_SVC_NS/$ENVOY_SVC clusterIP=$ENVOY_IP); host exposed via port-forward 8443:8443 8082:80"
+# 8. hub（image + keycloak 子 chart 镜像均从 harbor 拉；经网关 8443 与 issuer 端口一致）
+ISSUER="https://${SDP_GATEWAY_DOMAIN}:8443/keycloak/realms/sdp"
 AUTH_SETS=()
 if [ -z "${SKIP_AUTH:-}" ]; then
     AUTH_SETS=(
         --set auth.keycloakIssuerUrl="$ISSUER"
         --set auth.adminClientSecret='**********'
-        --set auth.trustedCASecret=console-tls
+        --set auth.trustedCASecret=sdp-ca
         --set auth.resolveHostIp="$ENVOY_IP"
-        --set keycloak.hostname="https://www.sdpworkflow.com:8443/keycloak"
+        --set keycloak.hostname="https://${SDP_GATEWAY_DOMAIN}:8443/keycloak"
         --set credentialEncryptionKey='sdp-dev-credential-key-000000000'
     )
     log "auth ON: issuer=$ISSUER hostAlias=$ENVOY_IP"
 fi
-HUB_HELM_ARGS=(--set image.imageAddr="localhost:5000/software-distribution-platform-hub:${VERSION}")
+HUB_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-hub:${VERSION}")
 if [ ${#AUTH_SETS[@]} -gt 0 ]; then HUB_HELM_ARGS+=("${AUTH_SETS[@]}"); fi
-"$HELM" upgrade --install hub "$HUB_DIR/build/hub/charts/software-distribution-platform-hub" \
-    -n "$NS" "${HUB_HELM_ARGS[@]}"
+"$HELM" upgrade --install hub "$HUB_DIR/build/hub/charts/software-distribution-platform-hub" -n "$NS" "${HUB_HELM_ARGS[@]}"
 if [ -n "${SKIP_AUTH:-}" ]; then
     kubectl -n "$NS" rollout status deploy/hub --timeout=180s
 else
-    #    KC_HOSTNAME 变更需 KC pod 重建（keycloakx OnDelete 策略不会自动滚动）；hub 启动时
-    #    要拉 discovery 且校验 issuer 严格一致 —— 必须先让 KC 按新 hostname 起来，再看 hub。
     kubectl -n "$NS" delete pod hub-keycloak-0 --ignore-not-found --force --grace-period=0 >/dev/null 2>&1 || true
     kubectl -n "$NS" wait --for=condition=ready pod/hub-keycloak-0 --timeout=240s \
-        || log "WARN: keycloak pod not ready in 240s (hub discovery 可能失败,稍后自愈)"
+        || log "WARN: keycloak pod not ready in 240s"
     kubectl -n "$NS" rollout status deploy/hub --timeout=240s
 fi
-log "hub ready: http://localhost:8080/api/v1"
+log "hub ready"
 
-# 8. 注册接入目标（runner 握手前提，幂等：已存在则重复插入被忽略）
-#    路径是 /targets —— 2026-09-21 的「Cluster→Target」改名把 API 从 /clusters 改成
-#    /targets，但本行当时漏改，于是注册**一直静默失败**（旧的 `|| true` 连错误也吞了，
-#    屏幕上没有任何线索）。现在显式回显 HTTP 码，失败必须可见。
-#    真对接后 API 全部要求 Bearer token，本步改为 401 可见跳过（target 由既有库数据承载）。
-REG_CODE=$(curl -s -o /tmp/sdp-register-target.json -w '%{http_code}' \
-    -X POST http://localhost:8080/api/v1/targets \
+# 9. 注册接入目标（幂等；auth ON 时 401 可见跳过）
+REG_CODE=$(curl -s -k -o /tmp/sdp-register-target.json -w '%{http_code}' --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 \
+    -X POST https://${SDP_GATEWAY_DOMAIN}:8443/api/v1/targets \
     -H "Content-Type: application/json" \
     -d '{"name":"local-dev","vendor":"kind","region":"local"}' 2>/dev/null || echo "000")
 case "$REG_CODE" in
     200|201) log "target registered: local-dev (HTTP $REG_CODE)" ;;
     409)     log "target local-dev already exists (HTTP 409) - ok" ;;
-    401)     log "auth ON - skip auto register (HTTP 401, use console with token to manage targets)" ;;
-    *)       log "WARN: register target failed (HTTP $REG_CODE): $(head -c 300 /tmp/sdp-register-target.json 2>/dev/null)" ;;
+    401)     log "auth ON - skip auto register (HTTP 401)" ;;
+    *)       log "WARN: register target failed (HTTP $REG_CODE)" ;;
 esac
 
-# 9. runner（chart 内含 CRDs[helm crds/ 目录，install-only] + RBAC + Deployment）
+# 10. runner（image 从 harbor）
 "$HELM" upgrade --install runner "$RUNNER_DIR/build/runner/charts/software-distribution-platform-runner" \
-    -n "$NS" --set image.imageAddr="localhost:5000/software-distribution-platform-runner:${VERSION}"
+    -n "$NS" --set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-runner:${VERSION}"
 kubectl -n "$NS" rollout status deploy/runner --timeout=180s
-log "runner ready, waiting for gateway handshake..."
+log "runner ready"
 
-# 10. console（纯静态镜像 + chart ConfigMap 注入 nginx 配置/证书，ClusterIP + ingress 443）
-#      注：console-tls / console-ingress-tls 已在 #6.5 确保就位。
-#      真对接：authDisabled=false + issuer/clientId/redirectUri 与 hub 侧同源（AUTH_SETS 同一开关）。
+# 11. console（image 从 harbor）
 AUTH_SETS_CONSOLE=()
 if [ -z "${SKIP_AUTH:-}" ]; then
     AUTH_SETS_CONSOLE=(
         --set auth.authDisabled=false
         --set auth.keycloakIssuerUrl="$ISSUER"
         --set auth.keycloakClientId=sdp-console
-        --set auth.keycloakRedirectUri="https://www.sdpworkflow.com:8443/auth/callback"
+        --set auth.keycloakRedirectUri="https://${SDP_GATEWAY_DOMAIN}:8443/auth/callback"
     )
 fi
-CONSOLE_HELM_ARGS=(--set image.imageAddr="localhost:5000/software-distribution-platform-console:${VERSION}")
+CONSOLE_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-console:${VERSION}")
 if [ ${#AUTH_SETS_CONSOLE[@]} -gt 0 ]; then CONSOLE_HELM_ARGS+=("${AUTH_SETS_CONSOLE[@]}"); fi
 "$HELM" upgrade --install console "$CONSOLE_DIR/build/console/charts/software-distribution-platform-console" \
     -n "$NS" "${CONSOLE_HELM_ARGS[@]}"
-#     显式重启：helm upgrade 模板未变不会重启 pod，而重跑时 ConfigMap(config.js/nginx.conf) 可能已更新、
-#     hub svc 也可能被重建(ClusterIP 变更)——nginx 启动时一次性解析 upstream，不重启会拿过期 IP 导致 /api 502。
 kubectl -n "$NS" rollout restart deploy/console
 kubectl -n "$NS" rollout status deploy/console --timeout=180s
 log "console ready"
 
-# 11. gateway 握手验证（runner 重连退避最长 32s，轮询 45s 上限）
+# 12. 网关握手验证
 OK=""
 for i in $(seq 1 15); do
     if kubectl -n "$NS" logs deploy/hub --tail=50 2>/dev/null | grep -qi "connected"; then OK=1; break; fi
     sleep 3
 done
-if [ -n "$OK" ]; then
-    log "gateway handshake OK"
-else
-    log "WARN: handshake not seen in 45s, runner logs:"
-    kubectl -n "$NS" logs deploy/runner --tail=10 || true
-fi
-
-# 12. console 访问入口：Envoy Gateway https（kind extraPortMappings 8443->30443，curl -k 直访；
-#     不依赖 port-forward——沙箱/终端会话结束会杀掉 port-forward 进程，不可靠）。
-#     本地自签证书：浏览器访问需 -k，或把 console/output/certs/ca.crt 加入系统信任
-#     （生产用手工创建的 secret，相应改用你自己的 CA）。
+[ -n "$OK" ] && log "gateway handshake OK" || log "WARN: handshake not seen in 45s"
 
 log "=========================================="
-log "hub:     http://localhost:8080/api/v1"
-log "console: https://localhost:8443  (ingress, 自签证书用 curl -k / 浏览器信任 ca.crt)"
+log "console: https://${SDP_GATEWAY_DOMAIN}:8443  (自签证书 curl -k / 浏览器信任 ca.crt)"
+log "harbor:  https://${HARBOR_REGISTRY}    (admin/${HARBOR_PASS})"
+log "hub:     https://${SDP_GATEWAY_DOMAIN}:8443/api/v1"
 log "集群:    kind sdp-dev | namespace: $NS | 版本: $VERSION"
 log "=========================================="

@@ -1,10 +1,55 @@
+# Harbor 经 Envoy Gateway 暴露（HTTPS 终止在网关，后端 harbor nginx:80 走 HTTP）。
+#
+# 本文件【自包含、独立于 sdp 网关】：自带 GatewayClass(harbor-eg) + EnvoyProxy(harbor-eg)
+# + Gateway(harbor-gateway) + HTTPRoute，不引用 sdp 的网关基础设施（gateway-sdp.yaml / sdp-eg）。
+# 域名统一为 harbor.sdpworkflow.com（标准 443，仅经 Gateway 暴露，不出现在任何镜像引用里；
+# 见 local-kind-dev/deploy/kind.yaml —— 节点经网关 ClusterIP 在集群内直达，宿主经 port-forward）。
+#
+# 前置：
+#   - EG controller 已装（envoy-gateway-helm-v1.6.1.tgz），且 harbor-eg 的 envoy 镜像走 localhost:5000 预推
+#     （bootstrap，envoy 自身镜像不能依赖 harbor —— harbor 可达性反而要靠它）。
+#   - harbor-tls Secret 已建（cert-build/certs/harbor.{crt,key}，SAN *.sdpworkflow.com），由 deploy-local.sh 创建。
+---
+# 独立的 GatewayClass（harbor 专用，不复用 sdp 的 sdp-eg）
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: harbor-eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: harbor-eg
+    namespace: harbor
+---
+# 独立的 EnvoyProxy（harbor 专用数据面，type: ClusterIP：与生产形态一致、零写死端口）。
+# 节点在集群内直接经此 ClusterIP 拉镜像（harbor.sdpworkflow.com -> 网关 ClusterIP，不经宿主进程）；
+# 宿主访问由 deploy-local.sh 起 sudo kubectl port-forward 443:443 暴露（仅用于 docker push / 浏览器）。
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: harbor-eg
+  namespace: harbor
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        container:
+          # 数据面镜像走 localhost:5000（bootstrap，节点拉不动 docker.io）；envoy 自身镜像不可依赖 harbor。
+          image: localhost:5000/envoyproxy/envoy:distroless-v1.36.4
+      envoyService:
+        type: ClusterIP
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: harbor-gateway
   namespace: harbor
 spec:
-  gatewayClassName: sdp-eg        # 本集群实际的 GatewayClass（kubectl get gatewayclass 确认）
+  # 用本文件自带的独立 GatewayClass，不依赖 sdp 的 sdp-eg
+  gatewayClassName: harbor-eg
   listeners:
     - name: http
       protocol: HTTP

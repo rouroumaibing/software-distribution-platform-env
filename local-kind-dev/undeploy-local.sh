@@ -1,6 +1,6 @@
 #!/bin/bash
 # undeploy-local.sh —— 本地全量部署卸载（与 deploy-local.sh 配对）
-# 卸载 helm releases (hub/runner/console) 并删除命名空间；保留 kind 集群与 registry 容器。
+# 卸载 helm releases (hub/runner/console + harbor) 并删除命名空间；保留 kind 集群与 registry 容器。
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,6 +20,14 @@ fi
 log "卸载 helm releases: hub / runner / console (ns $NS)"
 "$HELM" uninstall hub runner console -n "$NS" 2>/dev/null || true
 kubectl delete ns "$NS" 2>/dev/null || true
+
+# harbor（集群内镜像仓库，ns harbor；与 deploy-local.sh #6.8 配对）。
+# ns harbor 删除连带 Gateway/HTTPRoute/harbor-tls secret；envoy-gateway-system 里
+# harbor-gateway 专用的数据面 deploy/svc 由 EG 控制器随 Gateway 删除而 GC。
+log "卸载 harbor (ns harbor)..."
+"$HELM" uninstall harbor -n harbor 2>/dev/null || true
+kubectl delete ns harbor 2>/dev/null || true
+
 log "已卸载。"
 log "kind 集群 'sdp-dev' 保留（删除：kind delete cluster --name sdp-dev）。"
 log "registry 容器 'kind-registry' 与 docker 网络 'kind' 保留（如需清理：docker rm -f kind-registry; docker network rm kind）。"

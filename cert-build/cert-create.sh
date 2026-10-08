@@ -5,10 +5,11 @@ set -e
 PROJECT_ROOT=$(cd `dirname $0/`;pwd)
 cd ${PROJECT_ROOT}
 COMPONENTS=(console hub harbor)
-
+NAMESPACE="${NAMESPACE:-sdp-workflow}"
+DOMAINNAME="${DOMAINNAME:-sdpworkflow.com}"
 
 for component in "${COMPONENTS[@]}"; do
-    bash ${PROJECT_ROOT}/self-signed-ca-cert.sh --service ${component} --namespace sdp-workflow --domainname sdpworkflow.com
+    bash ${PROJECT_ROOT}/self-signed-ca-cert.sh --service ${component} --namespace ${NAMESPACE} --domainname ${DOMAINNAME}
     sleep 1
     # 检查一下是否有kubectl，然后生成secret yaml
 

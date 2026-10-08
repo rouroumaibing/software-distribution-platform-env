@@ -1,6 +1,9 @@
 # Harbor - bitnamicharts/harbor 27.0.3
 # user: admin
 adminPassword: "Admin@123"
+# 经 Envoy 网关（harbor-gateway）暴露为标准 443（https://harbor.sdpworkflow.com，无端口号）。
+# 节点经 kind 网桥网关 IP + 宿主经 127.0.0.1 各自解析到宿主 443 发布的 harbor 网关；
+# 与 kind.yaml 的 harbor mirror endpoint、三个 chart 的 imageAddr、build.sh 的 HARBOR_REGISTRY 三方一致（均不带端口）。
 externalURL: https://harbor.sdpworkflow.com
 
 exposureType: proxy
@@ -39,6 +42,12 @@ persistence:
       size: 50Gi
 
 global:
+  # 所有 harbor 子图镜像统一走 localhost:5000（kind-registry bootstrap 中转）；
+  # 节点 containerd 配了 localhost:5000 mirror，从内网秒级拉取，不依赖节点出网。
+  # 注意：image.repository 只写 bitnamilegacy/<name>（不带 localhost:5000 前缀），
+  # 由 global.imageRegistry 统一拼成 bitnamilegacy/<name>，否则 chart 会补默认
+  # docker.io 前缀导致镜像名非法（InvalidImageName）。
+  imageRegistry: localhost:5000
   security:
     allowInsecureImages: true
 portal:

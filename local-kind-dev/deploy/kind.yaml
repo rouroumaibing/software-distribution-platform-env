@@ -1,24 +1,46 @@
 # 本地脚手架（归 local-kind-dev/deploy/，software-distribution-platform-env 仓，**不随三仓打包**）：kind 单节点集群定义。
-# 三个项目仓独立于此 —— 集群/registry/端口映射都是本地测试基础设施。
-# - 主机 8082 -> 节点 30081：Envoy Gateway http（envoy svc NodePort，deploy-local.sh patch 固定）。
-# - 主机 8443 -> 节点 30443：Envoy Gateway https（console/keycloak 走 Gateway API 路由；
-#   curl -k --resolve www.sdpworkflow.com:8443:127.0.0.1 https://www.sdpworkflow.com:8443 可达）。
-# - containerd mirror：集群内引用 localhost:5000/<img> 的镜像自动回源到
-#   跑在 kind docker 网络里的 kind-registry（主机 docker push localhost:5000/...）。
-# 端口与同目录 gateway-sdp.yaml 的 EnvoyProxy/NodePort 语义成对，改一处须同步另一处。
+# 三个项目仓独立于此 —— 集群/registry 都是本地测试基础设施。
+# 端口暴露策略（与生产对齐：gateway/仓库均经域名访问，宿主侧不写死任何节点端口）：
+# - sdp-gateway / harbor-gateway 的数据面服务均为 ClusterIP（不写死端口，生产形态）；
+#   EnvoyProxy CRD v1.6.1 不支持声明 NodePort，故宿主访问统一由 deploy-local.sh 起 kubectl port-forward 暴露：
+#     * sdp-gateway：port-forward 本地 8443->svc 8443（https）、8082->svc 80（http）；
+#       curl -k --resolve www.sdpworkflow.com:8443:127.0.0.1 https://www.sdpworkflow.com:8443 可达。
+#     * harbor-gateway：sudo port-forward 宿主 443->svc 443，仅用于宿主 docker push / 浏览器访问；
+#       节点拉镜像不经此转发——节点在集群内经网关 ClusterIP 直达 harbor（harbor.sdpworkflow.com -> 网关 ClusterIP）。
+# - 不使用 kind extraPortMappings（避免改端口就要 recreate 集群的脆弱耦合）。
+# - containerd mirror：
+#   * localhost:5000 —— 仅作 bootstrap 中转（harbor 自身 bitnamilegacy 镜像、envoy 控制面/数据面镜像、
+#     节点直拉 docker.io 被失效代理挡死，故这些"启动期依赖"经 kind docker 网络里的 kind-registry 中转）。
+#   * harbor.sdpworkflow.com —— 平台服务镜像统一仓库（hub/runner/console/keycloak/postgres 全部推这里、从这儿拉），
+#     走标准 443（mirror key/endpoint 均不带端口）。节点经集群 DNS（CoreDNS rewrite）把 harbor.sdpworkflow.com
+#     解析到 harbor 网关 ClusterIP，在集群内直达 harbor（与生产"节点经 Gateway 域名拉镜像"一致），
+#     不写任何 IP、不经宿主进程、无端口写死。
+# 端口语义与同目录 gateway-sdp.yaml / harbor-gateway.yaml 的 EnvoyProxy 类型成对，改一处须同步另一处。
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: sdp-dev
 nodes:
   - role: control-plane
-    extraPortMappings:
-      - containerPort: 30081
-        hostPort: 8082
-        protocol: TCP
-      - containerPort: 30443
-        hostPort: 8443
-        protocol: TCP
 containerdConfigPatches:
   - |-
     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]
       endpoint = ["http://kind-registry:5000"]
+  # 通用 docker.io 镜像（bootstrap 期依赖）：节点经 kind-registry:5000 中转，
+  # 宿主把 registry:2 / envoyproxy/* / bitnamilegacy/* 等推到 localhost:5000 后节点即可拉。
+  # 节点在 kind 网络内，直连 docker.io 实测极慢（envoy/quay.io 曾 6 分钟不完成）；
+  # 故把 docker.io 镜像请求收口到 kind-registry:5000 中转（宿主侧已 pull 的镜像经内网秒级拉取）。
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+      endpoint = ["http://kind-registry:5000"]
+  # harbor.sdpworkflow.com：平台镜像统一仓库，走标准 443（无端口）。
+  # 节点 /etc/hosts 由 deploy-local.sh 在 harbor 网关 Programmed 后动态补 harbor.sdpworkflow.com -> 网关 ClusterIP，
+  # 故 endpoint 用域名即可（443 默认 https）。mirror key 必须与 pod 镜像引用里的 host 完全一致
+  # （harbor.sdpworkflow.com，无端口），否则节点拉取失败。
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."harbor.sdpworkflow.com"]
+      endpoint = ["https://harbor.sdpworkflow.com"]
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."harbor.sdpworkflow.com".tls]
+      insecure_skip_verify = true
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."harbor.sdpworkflow.com".auth]
+      username = "admin"
+      password = "Admin@123"

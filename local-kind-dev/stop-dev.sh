@@ -24,7 +24,8 @@ PATTERNS=(
   "software-distribution-platform-runner"
   "devops.*cmd/hub|cmd/hub.*devops"
   "vite.*console|console.*vite"
-  "kubectl.*port-forward.*sdp-system"
+  "kubectl.*port-forward.*sdp-workflow"
+  "kubectl.*port-forward.*harbor"
 )
 
 match_lines() {
@@ -77,6 +78,9 @@ main() {
       local pids
       pids=$(echo "$lines" | awk '{print $1}')
       echo "$pids" | xargs kill -TERM 2>/dev/null || true
+      # harbor 的 port-forward 由 sudo 拉起，sudo 不会透传信号给 kubectl 子进程，
+      # 故额外用 sudo pkill 确保 harbor 转发被真正杀掉。
+      sudo pkill -f 'port-forward.*harbor' 2>/dev/null || true
       sleep 5
       local left
       left=$(match_lines || true)
@@ -84,6 +88,7 @@ main() {
         echo "以下进程 5s 后仍在，升级为 KILL:"
         echo "$left"
         echo "$left" | awk '{print $1}' | xargs kill -KILL 2>/dev/null || true
+        sudo pkill -KILL -f 'port-forward.*harbor' 2>/dev/null || true
       fi
       echo "done."
       ;;

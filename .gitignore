@@ -1,6 +1,9 @@
 # ---- macOS 系统文件 ----
 .DS_Store
 
+# ---- kind 集群自动生成的 kubeconfig（含 CA 数据与本地地址，环境相关，绝不入库）----
+/.kubeconfig
+
 # ---- 第三方 helm chart 二进制：不入库，避免仓库膨胀与版本漂移 ----
 # 部署前需手动放置或从 helm registry 拉取（oci://docker.io/envoyproxy/gateway-helm v1.6.1、
 # oci://registry-1.docker.io/bitnamicharts/harbor 27.0.3），见 README 各组件说明。
