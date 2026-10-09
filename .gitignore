@@ -21,3 +21,6 @@
 /envoygateway/
 # harbor 安装/命令笔记（内含完整 values heredoc 与明文口令，正式 values 以 harbor/values.yaml 为准）
 /harbor/harbor-command-guide.txt
+
+# ---- deploy-local.sh 阶段化跨段状态（本地运行时产物，不入库）----
+/local-kind-dev/.deploy-state.env

@@ -1,0 +1,73 @@
+# SDP 平台告警规则（alerting-rules-design §2.2，STATUS #5 落地）。
+#
+# 分级启用（钢人裁定）：critical / warning 两个 group 分离 —— 预发环境先只挂
+# warning 组验证通知流，灰度再放开 critical 组，避免新规则误报直接打扰值班。
+# Prometheus 侧按 group name 选择性挂载即可（rule_file 全量 + group 级 eval 间隔
+# 不影响分级；分级启用通过 Alertmanager route 或按环境裁剪本文件实现）。
+#
+# 指标来源（与代码同源，勿在此臆造）：
+#   hub  internal/metrics   : sdp_hub_gateway_connected_targets{target}（1=在线,0=离线，
+#                             gateway 连接/断开时写）、sdp_hub_http_requests_total{method,status_class}
+#   runner pkg/metrics      : sdp_runner_connector_reconnects_total（含首连）、
+#                             sdp_runner_alert_failures_total{kind}
+#   Prometheus 抓取器        : up{job="sdp-runner"}（抓取失败的兜底信号）
+groups:
+  - name: sdp-critical
+    rules:
+      # target 级 WS 离线：hub 侧权威视角（连接断开写 0），持续 2m 才 fire，
+      # 避免滚动重启/抖动误报。恢复（重新握手写 1）后自动 resolve。
+      - alert: RunnerOffline
+        expr: sdp_hub_gateway_connected_targets == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Runner 离线：target {{ $labels.target }} 的 WS 连接已断开超过 2 分钟"
+          runbook: "检查 target 侧 runner 进程/网络；若为计划内停机，忽略本次告警。hub 视角：GET /api/v1/targets 看 lastHeartbeatAt。"
+
+      # Prometheus 抓取失败的兜底：RunnerOffline 依赖 hub 进程活着；
+      # hub 自身挂了 / runner /metrics 不可抓时由本规则兜住（双保险）。
+      - alert: TargetDown
+        expr: up{job="sdp-runner"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus 抓取 runner 失败：{{ $labels.instance }} 持续 3 分钟不可达"
+          runbook: "区分两种情况：runner 进程死（TargetDown 且 RunnerOffline 同时 fire）或仅 /metrics 端口异常。先 kubectl get pod 看 runner 状态。"
+
+      # hub 5xx 比例激增：5 分钟窗口内 5xx 占比 > 5%。分母为零时结果是 NaN，
+      # 比较不成立 —— 低流量时段不会误报，符合「激增」语义。
+      - alert: HubErrorSpike
+        expr: |
+          sum(rate(sdp_hub_http_requests_total{status_class="5xx"}[5m]))
+            /
+          sum(rate(sdp_hub_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "hub 5xx 占比超过 5% 持续 5 分钟（当前 {{ $value | humanizePercentage }}）"
+          runbook: "看 hub 日志 ERROR 段与最近发布；5xx 按路由分布查 GET /api/v1/audit-logs。"
+
+  - name: sdp-warning
+    rules:
+      # WS 抖动：15 分钟内重连超过 3 次（首连也计入 reconnects_total，正常稳态
+      # 15m ≤ 1 次）。用于发现网络不稳 / hub 滚动重启过频。
+      - alert: RunnerFlapping
+        expr: increase(sdp_runner_connector_reconnects_total[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "runner 与 hub 的连接 15 分钟内重连超过 3 次（当前 {{ $value | printf \"%.0f\" }} 次）"
+          runbook: "检查 runner↔hub 网络路径（kind 环境:宿主代理/NAT 超时）；偶发 2-3 次可忽略。"
+
+      # 流水线连环失败：10 分钟内 runner 上报的 pipelinerun 级失败 > 3 次。
+      # kind 标签取值: pipelinerun | taskrun | rollout（runner pkg/metrics.Alert）。
+      - alert: PipelineFailBurst
+        expr: increase(sdp_runner_alert_failures_total{kind="pipelinerun"}[10m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "10 分钟内流水线失败超过 3 次（当前 {{ $value | printf \"%.0f\" }} 次）"
+          runbook: "运行中心按 phase=Failed 过滤定位失败运行；常见为镜像拉取失败或构建脚本退出。"
