@@ -130,11 +130,11 @@ ensure_helm() {
 # 确保本地已有某镜像：存在则跳过，不存在才拉取（避免盲目重拉 / 网络失败时尽早暴露）
 ensure_image() {
     local img="$1"
-    if docker image inspect "$img" >/dev/null 2>&1; then
+    if sdp_inspect "$img" >/dev/null 2>&1; then
         log "image exists, skip pull: $img"
     else
         log "pulling $img ..."
-        docker pull -q "$img" >/dev/null || { log "WARN: pull $img failed"; return 1; }
+        sdp_pull -q "$img" >/dev/null || { log "WARN: pull $img failed"; return 1; }
     fi
 }
 
@@ -294,8 +294,8 @@ node_push_to_harbor() {
     local b="${src##*/}"; tag="${b##*:}"; name="${b%:*}"
     harborgw="harbor.harbor.svc.cluster.local/${HARBOR_PROJECT}/${name}:${tag}"
     log "node-push: $src -> $harborgw (经节点 containerd)"
-    # 宿主 save | 节点 import（多架构 index 可能报 missing blob，但 amd64 manifest 已就绪，忽略非零）
-    docker save "$src" 2>/dev/null | docker exec -i "$NODE" ctr -n k8s.io images import - >/dev/null 2>&1 || true
+    # 宿主 save（按运行时：docker / nerdctl --format docker）| 节点 import（多架构 index 可能报 missing blob，但 amd64 manifest 已就绪，忽略非零）
+    sdp_save "$src" 2>/dev/null | docker exec -i "$NODE" ctr -n k8s.io images import - >/dev/null 2>&1 || true
     # 节点侧按 basename:tag 定位真实 ref（docker save/ctr import 会给无 registry 的本地镜像补 docker.io/library/ 前缀）。
     # 注意：awk 不得用 exit 提前退出——ctr images ls 输出超过管道缓冲(64KB)后，exit 会令上游 ctr
     # 收到 SIGPIPE(141)，pipefail+set -e 直接杀脚本（2026-10-09 实测三连死因），改用 found 旗标读完整个输入。
@@ -344,14 +344,68 @@ push_image_to_harbor() {
 # 把镜像推到本地 registry（仅 bootstrap：envoy + harbor 自身镜像；节点直拉 docker.io 被代理挡死）
 push_to_local_registry() {
     local src="$1" dst="$2"
-    if ! docker image inspect "$dst" >/dev/null 2>&1; then
-        docker image inspect "$src" >/dev/null 2>&1 || docker pull -q "$src" >/dev/null \
+    if ! sdp_inspect "$dst" >/dev/null 2>&1; then
+        sdp_inspect "$src" >/dev/null 2>&1 || sdp_pull -q "$src" >/dev/null \
             || { log "WARN: pull $src failed"; return 1; }
-        docker tag "$src" "$dst"
+        sdp_tag "$src" "$dst"
     fi
-    docker push -q "$dst" >/dev/null || { log "WARN: push $dst failed"; return 1; }
+    sdp_push -q "$dst" >/dev/null || { log "WARN: push $dst failed"; return 1; }
     log "bootstrap image ready: $dst"
 }
+
+# ---------- 容器运行时自感知分派（docker / containerd-nerdctl 双支持）----------
+# k8s 1.24+ 默认 containerd、节点无 docker：镜像操作按本地可用运行时分派。
+# 默认 nerdctl（containerd 工具）；若环境存在 docker 命令则重赋为 docker；
+# 否则保持 nerdctl；nerdctl 须已在环境中就绪，缺失直接报失败（不做自动安装）。
+# 注：kind 节点管理（docker network/run/inspect）与节点侧 ctr 桥接保持 docker/ctr 不变——
+#     本脚本主要跑在 Win/Mac Docker Desktop，且节点永远是 containerd，ctr 通用。
+SDP_RUNTIME="${SDP_RUNTIME:-nerdctl}"
+
+ensure_nerdctl() {
+    # nerdctl 硬判断：环境中必须已安装 nerdctl + buildkitd，否则直接报失败。
+    command -v nerdctl >/dev/null 2>&1 || {
+        echo "ERROR: 当前环境无 docker，且未检测到 nerdctl，无法构建镜像。请先安装 nerdctl + buildkitd。" >&2
+        exit 1
+    }
+    command -v buildkitd >/dev/null 2>&1 || {
+        echo "ERROR: 检测到 nerdctl 但缺少 buildkitd（nerdctl build 必需），请先安装 buildkitd。" >&2
+        exit 1
+    }
+    pgrep -x buildkitd >/dev/null 2>&1 || nohup buildkitd --containerd-worker --addr tcp://127.0.0.1:1234 >/var/log/buildkitd.log 2>&1 &
+    export BUILDKIT_HOST=tcp://127.0.0.1:1234
+}
+
+resolve_runtime() {
+    case "${SDP_RUNTIME}" in docker|nerdctl) ;; *) echo "ERROR: SDP_RUNTIME 仅支持 docker|nerdctl" >&2; exit 1 ;; esac
+    if command -v docker >/dev/null 2>&1; then SDP_RUNTIME=docker; return 0; fi
+    ensure_nerdctl
+    nerdctl info >/dev/null 2>&1 || { echo "ERROR: containerd/nerdctl 不可达" >&2; exit 1; }
+}
+
+sdp_build() { local ctx="$1" img="$2"; shift 2
+    case "${SDP_RUNTIME}" in
+        docker)  docker  build  "$@" -t "$img" "$ctx" ;;
+        nerdctl) nerdctl build  "$@" -t "$img" "$ctx" ;;
+    esac; }
+sdp_save() {
+    if [ -n "${2:-}" ]; then
+        case "${SDP_RUNTIME}" in
+            docker)  docker  save -o "$2" "$1" ;;
+            nerdctl) nerdctl save --format docker -o "$2" "$1" ;;
+        esac
+    else
+        case "${SDP_RUNTIME}" in
+            docker)  docker  save "$1" ;;
+            nerdctl) nerdctl save --format docker "$1" ;;
+        esac
+    fi; }
+sdp_inspect() { case "${SDP_RUNTIME}" in docker) docker image inspect "$1" ;; nerdctl) nerdctl image inspect "$1" ;; esac; }
+sdp_pull() { case "${SDP_RUNTIME}" in docker) docker pull "$1" ;; nerdctl) nerdctl pull "$1" ;; esac; }
+sdp_tag() { case "${SDP_RUNTIME}" in docker) docker tag "$1" "$2" ;; nerdctl) nerdctl tag "$1" "$2" ;; esac; }
+sdp_push() { case "${SDP_RUNTIME}" in docker) docker push "$1" ;; nerdctl) nerdctl push "$1" ;; esac; }
+sdp_login() { case "${SDP_RUNTIME}" in docker) docker login "$@" ;; nerdctl) nerdctl login "$@" ;; esac; }
+
+resolve_runtime; echo "== container runtime: ${SDP_RUNTIME} =="
 
 # ---------- 阶段接口 ----------
 CERT_SCRIPT_SRC="$ENV_DIR/cert-build/cert-create.sh"
@@ -492,7 +546,7 @@ stage_harbor() {
     HARBOR_GW_DNS="${HARBOR_ENVOY_SVC}.${HARBOR_ENVOY_NS}.svc.cluster.local"
     ensure_node_dns_harbor "$HARBOR_GW_DNS"
     ensure_harbor_project
-    docker login "${HARBOR_REGISTRY}" -u "${HARBOR_USER}" -p "${HARBOR_PASS}" >/dev/null 2>&1 || true
+    sdp_login "${HARBOR_REGISTRY}" -u "${HARBOR_USER}" -p "${HARBOR_PASS}" >/dev/null 2>&1 || true
     # 平台依赖镜像先推 harbor（postgres / keycloak），三个组件镜像稍后由本脚本经节点推（build.sh 只构建不推送）
     push_image_to_harbor "postgres:16-alpine"
     push_image_to_harbor "quay.io/keycloak/keycloak:26.7.4"
@@ -505,7 +559,7 @@ stage_images() {
     BUILD_LOG_DIR="$ROOT/.logs"; mkdir -p "$BUILD_LOG_DIR"
     for comp in hub runner console; do
         mod_dir="$ROOT/software-distribution-platform-${comp}"
-        if docker image inspect "software-distribution-platform-${comp}:${VERSION}" >/dev/null 2>&1; then
+        if sdp_inspect "software-distribution-platform-${comp}:${VERSION}" >/dev/null 2>&1; then
             # 镜像已存在（前次构建产物仍在宿主 docker），跳过重建，仅由下方 node_push 循环重新推送；
             # 若改了源码想强制重构建，先 docker rmi software-distribution-platform-${comp}:${VERSION} 或升版本号。
             log "image software-distribution-platform-${comp}:${VERSION} present, skip rebuild (re-push via node below)"
