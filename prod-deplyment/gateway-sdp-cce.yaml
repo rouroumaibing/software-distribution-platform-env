@@ -1,0 +1,40 @@
+# SDP 平台统一入口网关（CCE Envoy Gateway 插件版）—— 归 prod-deplyment/（software-distribution-platform-env 仓）。
+#
+# 与 local-kind-dev/deploy/gateway-sdp.yaml 的差异（云上形态）：
+#   - GatewayClass 用 CCE 官方插件自建的 `envoy-gateway`，插件按 listeners 自动创建
+#     独享型 ELB 与监听器（按需计费）；www.sdpworkflow.com 的 DNS 记录指向该 ELB IP。
+#   - https listener 端口为标准 443（本地 kind 8443 是端口映射时代的过渡裁定；
+#     ELB 443 下 X-Forwarded-Port=443，Keycloak issuer 推导不带端口，与生产形态一致）。
+#   - 不需要 GatewayClass/EnvoyProxy 资源（插件自带），数据面由插件按 Gateway 管理。
+#
+# 前置：CCE 插件「Envoy Gateway」已安装且运行中；ns sdp-workflow 已存在；
+#       secret console-ingress-tls（tls 类型，源自 env 仓 cert-build/certs 的 console.crt/.key）已创建。
+# 路由：hub/runner/console 三仓 chart 自带各自 HTTPRoute，按名字 parentRef 到本 Gateway，
+#       无需在本文件重复声明。
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: sdp-gateway
+  namespace: sdp-workflow
+spec:
+  gatewayClassName: envoy-gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: www.sdpworkflow.com
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: www.sdpworkflow.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: console-ingress-tls
+      allowedRoutes:
+        namespaces:
+          from: Same

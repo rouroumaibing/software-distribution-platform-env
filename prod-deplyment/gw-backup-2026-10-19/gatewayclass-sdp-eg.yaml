@@ -1,0 +1,28 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"gateway.networking.k8s.io/v1","kind":"GatewayClass","metadata":{"annotations":{},"name":"sdp-eg"},"spec":{"controllerName":"gateway.envoyproxy.io/gatewayclass-controller","parametersRef":{"group":"gateway.envoyproxy.io","kind":"EnvoyProxy","name":"sdp-eg","namespace":"sdp-workflow"}}}
+  creationTimestamp: "2026-10-19T04:29:51Z"
+  finalizers:
+  - gateway-exists-finalizer.gateway.networking.k8s.io
+  generation: 1
+  name: sdp-eg
+  resourceVersion: "34625"
+  uid: ddba9382-a9c7-444b-863c-b5eb33834be6
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: sdp-eg
+    namespace: sdp-workflow
+status:
+  conditions:
+  - lastTransitionTime: "2026-10-19T04:29:51Z"
+    message: Valid GatewayClass
+    observedGeneration: 1
+    reason: Accepted
+    status: "True"
+    type: Accepted

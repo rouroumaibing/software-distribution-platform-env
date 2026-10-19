@@ -1,0 +1,3 @@
+# 由 hce-2.0-64bit-env.sh 生成（CCE 节点 docker.io 直连不通，走镜像源）
+[registry."docker.io"]
+  mirrors = ["https://docker.1panel.live", "https://dockerproxy.net", "https://docker.m.daocloud.io", "https://docker.1ms.run"]

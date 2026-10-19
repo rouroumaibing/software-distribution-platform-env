@@ -113,3 +113,17 @@ cd software-distribution-platform-env/local-kind-dev
 - **（macOS Docker Desktop）宿主 `docker push` 可能连不上 host 侧 port-forward**：Docker Desktop 的 docker daemon 运行在独立 VM，与宿主 shell 的 `127.0.0.1` 不互通，导致 `docker push harbor.sdpworkflow.com/...`（经宿主 `/etc/hosts` + port-forward 443）报 `connection refused`。若遇此情况，可改用集群内推送（节点 `ctr images push --skip-verify --plain-http --user admin:Admin@123 harbor.harbor.svc.cluster.local/sdp/<img>:<tag>`，多架构镜像按 digest 推送单架构），或把 harbor 网关临时暴露为节点可达地址。脚本当前仍用宿主 docker push（与既往全量测试一致），请按本机环境验证。
 - **sdp 网关 https 未 Programmed**：依赖 `console-ingress-tls`（网关引用名）已存在；若缺失，需确认 `cert-build` 产出与该命名的 secret 对齐（当前为已知历史不一致，未在本轮处理）。
 - **重建集群会丢数据**：PVC 为本地测试数据，重建即弃；helm 会全量重装。
+
+---
+
+## 六、镜像构建工具链要求（containerd 路线）
+
+三组件镜像由各仓 `build/<comp>/build.sh` 构建。无 docker 的环境（如 CCE 托管节点）走 nerdctl + buildkitd 复用宿主 containerd，对工具链版本有**硬要求**：
+
+| 工具 | 版本要求 | 原因 |
+| --- | --- | --- |
+| nerdctl | **>= 2.x** | `nerdctl save` 默认输出 docker 归档格式，无 `--format` 旗标；`build.sh` 的 `sdp_save` 按此直写 |
+| buildkitd | **>= v0.34** | `--containerd-worker` 为 string 型（true/false/auto），`build.sh` 用 `--containerd-worker=true` 显式赋值拉起；裸旗标会把后面的 `--addr` 当值吃掉导致 `strconv.ParseBool` 崩溃 |
+| containerd | 复用宿主托管实例 | **不要安装 docker / containerd.io**（会与宿主 containerd.service 冲突，CCE 节点尤其如此） |
+
+buildkitd 读取默认配置 `/etc/buildkit/buildkitd.toml`，docker.io 直连不通的环境需在此配置 registry mirrors（写法参见同仓 `prod-deplyment/hce-2.0-64bit-env.sh`，该脚本幂等，可直接在目标节点执行补齐）。版本要求的统一权威见 docs 仓 `shared/BUILD-TOOLCHAIN.md`。

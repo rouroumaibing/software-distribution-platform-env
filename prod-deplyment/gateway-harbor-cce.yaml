@@ -1,0 +1,81 @@
+# Harbor 网关（CCE Envoy Gateway 插件版）—— 归 prod-deplyment/（software-distribution-platform-env 仓）。
+#
+# 与 local-kind-dev/deploy/gateway-sdp.yaml 的差异（云上形态）：
+#   - GatewayClass 用 CCE 官方 Envoy Gateway 插件自建的 `envoy-gateway`（插件安装即存在，
+#     勿手动删除；见 https://support.huaweicloud.com/usermanual-cce/cce_10_1147.html），
+#     不再用自装社区版的 sdp-eg class / EnvoyProxy / helm release eg（均已卸载/待清理）。
+#   - 插件按本 Gateway 的 listeners 自动创建独享型 ELB 与监听器（按需计费），
+#     ELB 地址出现在 gateway .status.addresses；harbor.sdpworkflow.com 的 DNS 记录指向该 ELB IP。
+#   - 数据面 Deployment/Service 由插件按 Gateway 管理，命名与自装版（envoy-harbor-harbor-gateway-*）可能不同。
+#
+# 前置：CCE 插件「Envoy Gateway」已安装且运行中；ns harbor 已存在；secret harbor-tls 已存在。
+# 说明：harbor 路由只有 HTTPRoute harbor（/ -> harbor svc 80，请求超时 0s 长连接）与
+#       harbor-http-redirect（80 -> https 301 跳转），随本文件一并创建，无需 chart 携带。
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: harbor-gateway
+  namespace: harbor
+spec:
+  gatewayClassName: envoy-gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: harbor.sdpworkflow.com
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: harbor.sdpworkflow.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: harbor-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: harbor
+  namespace: harbor
+spec:
+  hostnames:
+    - harbor.sdpworkflow.com
+  parentRefs:
+    - name: harbor-gateway
+      sectionName: https
+  rules:
+    - backendRefs:
+        - name: harbor
+          port: 80
+          weight: 1
+      matches:
+        - path:
+            type: PathPrefix
+            value: /
+      timeouts:
+        request: 0s
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: harbor-http-redirect
+  namespace: harbor
+spec:
+  hostnames:
+    - harbor.sdpworkflow.com
+  parentRefs:
+    - name: harbor-gateway
+      sectionName: http
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

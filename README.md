@@ -33,7 +33,7 @@
       - `helm pull envoyproxy/gateway-helm --version 1.6.1 --untar=false --filename local-kind-dev/deploy/envoy-gateway-helm-v1.6.1.tgz`
       - 或前往 https://github.com/envoyproxy/gateway/releases/tag/v1.6.1 下载 `gateway-helm-v1.6.1.tgz`，重命名为 `envoy-gateway-helm-v1.6.1.tgz` 放入 `local-kind-dev/deploy/`。
 
-不入库清单（`.gitignore` 全量约定，2026-09-28 起）
+不入库清单（`.gitignore` 节选提示，非穷举：以下为需人工知晓的非显然项；完整忽略规则以根 `.gitignore` 为准，二者非镜像关系）
 - `.DS_Store`（macOS 系统文件）
 - 第三方 helm chart 二进制：`local-kind-dev/deploy/*.tgz`（envoy-gateway-helm）、`harbor/*.tgz`（bitnamicharts/harbor 27.0.3）
 - 证书生成产物 `cert-build/certs/`：`cert-create.sh` 运行期生成，含 `ca.key` 等私钥，**绝不入库**

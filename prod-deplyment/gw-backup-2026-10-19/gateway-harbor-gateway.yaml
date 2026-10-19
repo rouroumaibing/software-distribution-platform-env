@@ -1,0 +1,105 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"gateway.networking.k8s.io/v1","kind":"Gateway","metadata":{"annotations":{},"name":"harbor-gateway","namespace":"harbor"},"spec":{"gatewayClassName":"sdp-eg","listeners":[{"allowedRoutes":{"namespaces":{"from":"Same"}},"hostname":"harbor.sdpworkflow.com","name":"http","port":80,"protocol":"HTTP"},{"allowedRoutes":{"namespaces":{"from":"Same"}},"hostname":"harbor.sdpworkflow.com","name":"https","port":443,"protocol":"HTTPS","tls":{"certificateRefs":[{"name":"harbor-tls"}],"mode":"Terminate"}}]}}
+  creationTimestamp: "2026-10-19T04:46:26Z"
+  generation: 1
+  name: harbor-gateway
+  namespace: harbor
+  resourceVersion: "34816"
+  uid: 3c979488-db3e-49e2-a6df-a67b556b7224
+spec:
+  gatewayClassName: sdp-eg
+  listeners:
+  - allowedRoutes:
+      namespaces:
+        from: Same
+    hostname: harbor.sdpworkflow.com
+    name: http
+    port: 80
+    protocol: HTTP
+  - allowedRoutes:
+      namespaces:
+        from: Same
+    hostname: harbor.sdpworkflow.com
+    name: https
+    port: 443
+    protocol: HTTPS
+    tls:
+      certificateRefs:
+      - group: ""
+        kind: Secret
+        name: harbor-tls
+      mode: Terminate
+status:
+  addresses:
+  - type: IPAddress
+    value: 10.247.21.246
+  conditions:
+  - lastTransitionTime: "2026-10-19T04:46:57Z"
+    message: The Gateway has been scheduled by Envoy Gateway
+    observedGeneration: 1
+    reason: Accepted
+    status: "True"
+    type: Accepted
+  - lastTransitionTime: "2026-10-19T04:46:57Z"
+    message: Address assigned to the Gateway, 1/1 envoy replicas available
+    observedGeneration: 1
+    reason: Programmed
+    status: "True"
+    type: Programmed
+  listeners:
+  - attachedRoutes: 1
+    conditions:
+    - lastTransitionTime: "2026-10-19T04:46:57Z"
+      message: Sending translated listener configuration to the data plane
+      observedGeneration: 1
+      reason: Programmed
+      status: "True"
+      type: Programmed
+    - lastTransitionTime: "2026-10-19T04:46:57Z"
+      message: Listener has been successfully translated
+      observedGeneration: 1
+      reason: Accepted
+      status: "True"
+      type: Accepted
+    - lastTransitionTime: "2026-10-19T04:46:57Z"
+      message: Listener references have been resolved
+      observedGeneration: 1
+      reason: ResolvedRefs
+      status: "True"
+      type: ResolvedRefs
+    name: http
+    supportedKinds:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+  - attachedRoutes: 1
+    conditions:
+    - lastTransitionTime: "2026-10-19T04:46:57Z"
+      message: Sending translated listener configuration to the data plane
+      observedGeneration: 1
+      reason: Programmed
+      status: "True"
+      type: Programmed
+    - lastTransitionTime: "2026-10-19T04:46:57Z"
+      message: Listener has been successfully translated
+      observedGeneration: 1
+      reason: Accepted
+      status: "True"
+      type: Accepted
+    - lastTransitionTime: "2026-10-19T04:46:57Z"
+      message: Listener references have been resolved
+      observedGeneration: 1
+      reason: ResolvedRefs
+      status: "True"
+      type: ResolvedRefs
+    name: https
+    supportedKinds:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
