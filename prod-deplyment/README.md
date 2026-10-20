@@ -21,6 +21,18 @@
 | `e2e-cancel-rerun.sh` | 取消/重跑定向验证（PASS=11） |
 | `e2e-canary.sh` | canary 真流量验收：release 流水线 → Rollout 步进 → 50% 暂停窗口合成流量采样 → 权重快照回流 → 100% 收口 |
 
+### 环境清理脚本（云上节点直跑，与部署/验收同源）
+
+默认仅做**可逆卸载**（保留命名空间与 PVC 数据，可重新部署恢复）；加 `--delete-namespace` / `--delete-pvc` 才触碰不可逆数据。每条删除前默认把各命名空间 manifest 备份到 `.cleanup-backup/`（节点本地目录，`--no-backup` 跳过）。均支持 `--dry-run` 预览、`--kubeconfig` 指定。
+
+| 脚本 | 清理范围 |
+| --- | --- |
+| `cleanup-sdp-platform.sh` | `sdp-workflow` 下 hub/console/runner/postgresql 四个 release（hub 卸载连带 keycloak）+ `sdp-gateway` 网关与全部 HTTPRoute（释放 CCE ELB）；可选 `--delete-crds` 删集群级平台 CRD、`--delete-namespace`/`--delete-pvc` 删 ns 与数据 |
+| `cleanup-nginx-canary.sh` | 两个 `nginx-canary` release（sdp-run / sdp-workflow）+ sdp-run 内 runner 动态创建的灰度遗留（Rollout / `nginx-canary-canary` Deploy / `nginx-canary-sdp` Svc / taskrun job）；可选 `--delete-namespace`/`--delete-pvc` |
+| `cleanup-harbor.sh` | `harbor` release + `harbor-gateway` 网关/路由 + `harbor-tls` secret + kube-system 的 `harbor-ca-trust` DaemonSet（节点 CA 分发）；registry PVC 设了 `resourcePolicy: keep`，需 `--delete-pvc`/`--delete-namespace` 才清数据 |
+
+> 不触碰 `envoy-gateway` GatewayClass（CCE 托管插件，删除即破坏插件）。清理顺序建议：先 nginx 与平台，最后 harbor。
+
 前提：平台已部署（`hce-2.0-64bit-deploy.sh`）、`nginx-canary` stable 已入 harbor 并 helm 部署（见 example 仓 `nginx-canary/`）。
 
 ## 网关与入口（云上约束）

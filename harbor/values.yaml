@@ -1,6 +1,8 @@
 # Harbor - bitnamicharts/harbor 27.0.3
 # user: admin
-adminPassword: "Admin@123"
+# 口令策略（2026-10-20 决策）：不写死 adminPassword —— 留空时 chart 默认 adminPassword=""
+# 由 bitnami common.secrets.passwords.manage 随机生成 22 位存 Secret（带 lookup 持久化，helm upgrade
+# 不重置）；部署后从 Secret 取回（见 harbor-command-guide.txt「取回 admin 口令」）。harbor 为周边依赖，已解耦。
 # 经 Envoy 网关（harbor-gateway）暴露为标准 443（https://harbor.sdpworkflow.com，无端口号）。
 # 节点经 kind 网桥网关 IP + 宿主经 127.0.0.1 各自解析到宿主 443 发布的 harbor 网关；
 # 与 kind.yaml 的 harbor mirror endpoint、三个 chart 的 imageAddr、build.sh 的 HARBOR_REGISTRY 三方一致（均不带端口）。
@@ -19,12 +21,9 @@ nginx:
 core:
   image:
     repository: bitnamilegacy/harbor-core
-  secret: "3fcd7fa502d30cbf"
-  xsrfKey: "f56e62d12c419eb501e58862d0a9bb84"
 jobservice:
   image:
     repository: bitnamilegacy/harbor-jobservice
-  secret: "369938d94b4a7632"
 registry:
   server:
     image:
@@ -32,7 +31,6 @@ registry:
   controller:
     image:
       repository: bitnamilegacy/harbor-registryctl
-  secret: "239e3b4da53bcec5"
 
 persistence:
   enabled: true
