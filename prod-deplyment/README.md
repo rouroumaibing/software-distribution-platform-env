@@ -11,6 +11,18 @@
 | `hce-2.0-64bit-deploy.sh` | Huawei Cloud EulerOS 2.0 (x86_64) | **SDP 平台一键部署**：工具检查 → ns/secrets（幂等）→ postgresql → hub/console/runner（组件包）；网关/DNS/验证不在职责内 |
 | `run.sh` | —— | 部署运行入口（组件包 → 推镜像 → helm install） |
 
+### E2E 验证脚本（云上节点直跑）
+
+云上验证脚本（认证/取数全部脚本内动态完成，一条命令直跑；脚本真源在本目录）：
+
+| 脚本 | 覆盖范围 |
+| --- | --- |
+| `e2e-smoke.sh` | 全页面 API 契约冒烟（PASS=15） |
+| `e2e-cancel-rerun.sh` | 取消/重跑定向验证（PASS=11） |
+| `e2e-canary.sh` | canary 真流量验收：release 流水线 → Rollout 步进 → 50% 暂停窗口合成流量采样 → 权重快照回流 → 100% 收口 |
+
+前提：平台已部署（`hce-2.0-64bit-deploy.sh`）、`nginx-canary` stable 已入 harbor 并 helm 部署（见 example 仓 `nginx-canary/`）。
+
 ## 网关与入口（云上约束）
 
 - 云上统一使用 CCE 官方「Envoy Gateway」插件（GatewayClass `envoy-gateway`），插件按 Gateway listeners 自动创建独享型 ELB；**不装社区版 Envoy Gateway**——自建 EG 数据面 svc 为 ClusterIP，云上无 MetalLB，无法对外暴露。

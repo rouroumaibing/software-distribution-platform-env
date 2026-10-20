@@ -2,8 +2,10 @@
 # prod-deployment 部署脚本（云上托管 K8s）
 # 流程：检查工作目录下组件包 -> 通配匹配解压 -> 上传镜像到 registry -> helm3 安装 chart（不检查安装结果）
 # 前提：组件包由三仓 build.sh 产出，格式 software-distribution-platform-<组件>-<版本>.tar.gz，
-#       包内含 charts/（chart 源目录）与 images/（docker save 的镜像 tar）。
+#       包内含 charts/（chart 源目录）与 images/（docker 归档格式的镜像 tar）。
 # registry 的 project 须预先存在（如 harbor 的 sdp 项目），本脚本不创建。
+# 镜像操作走 --runtime 指定的容器运行时：nerdctl（CCE 托管节点，默认；要求 >= 2.x，
+# 见 docs 仓 shared/BUILD-TOOLCHAIN.md）或 docker（自管 ECS 节点）。
 
 set -euo pipefail
 
@@ -13,8 +15,9 @@ WORKDIR="${SCRIPT_DIR}"          # 组件包所在目录
 NAMESPACE="sdp-workflow"         # 部署命名空间（同时 --set 覆盖 chart values.namespace）
 REGISTRY=""                      # 必填：镜像上传目标，如 registry.example.com/sdp
 KUBECONFIG_PATH=""               # 可选：不传则继承环境 KUBECONFIG
-REGISTRY_USER=""                 # 可选：registry 认证（提供则先 docker login）
+REGISTRY_USER=""                 # 可选：registry 认证（提供则先 login）
 REGISTRY_PASS=""
+RUNTIME="nerdctl"                # 镜像操作运行时：nerdctl | docker
 DRY_RUN=0                        # 1 = 只打印将执行的命令，不实际执行
 
 COMPONENTS=(hub runner console)  # 已知组件前缀（用于从包名稳健提取组件与版本）
@@ -29,12 +32,14 @@ usage() {
   --kubeconfig <path>     指定 kubeconfig，默认继承环境 KUBECONFIG
   --registry-user <u>     可选，registry 认证用户（与 --registry-pass 成对）
   --registry-pass <p>     可选，registry 认证口令
+  --runtime <name>        镜像操作运行时 nerdctl|docker，默认 ${RUNTIME}
   --dry-run               只打印将执行的命令，不实际执行
   -h, --help              显示本帮助
 
 示例:
-  ./run.sh --registry registry.example.com/sdp
-  ./run.sh --registry registry.example.com/sdp --dry-run
+  ./run.sh --registry harbor.sdpworkflow.com/sdp
+  ./run.sh --registry registry.example.com/sdp --runtime docker
+  ./run.sh --registry harbor.sdpworkflow.com/sdp --dry-run
 USAGE
 }
 
@@ -45,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --kubeconfig)     [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; KUBECONFIG_PATH="$2"; shift 2 ;;
         --registry-user)  [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; REGISTRY_USER="$2"; shift 2 ;;
         --registry-pass)  [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; REGISTRY_PASS="$2"; shift 2 ;;
+        --runtime)        [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; RUNTIME="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                echo "错误: 未知参数 $1"; usage; exit 1 ;;
@@ -55,8 +61,9 @@ log() { echo "[deploy] $*"; }
 warn() { echo "[deploy][WARN] $*" >&2; }
 
 # ---------- 前置检查 ----------
+[[ "${RUNTIME}" == "nerdctl" || "${RUNTIME}" == "docker" ]] || { echo "错误: --runtime 只支持 nerdctl|docker"; exit 1; }
 [[ -n "${REGISTRY}" ]] || { echo "错误: --registry 必填"; usage; exit 1; }
-command -v docker >/dev/null 2>&1 || { echo "错误: 未找到 docker"; exit 1; }
+command -v "${RUNTIME}" >/dev/null 2>&1 || { echo "错误: 未找到 ${RUNTIME}"; exit 1; }
 command -v helm  >/dev/null 2>&1 || { echo "错误: 未找到 helm3"; exit 1; }
 if [[ -n "${KUBECONFIG_PATH}" ]]; then
     [[ -f "${KUBECONFIG_PATH}" ]] || { echo "错误: kubeconfig 不存在: ${KUBECONFIG_PATH}"; exit 1; }
@@ -66,7 +73,7 @@ fi
 
 # 组件包通配匹配（software-distribution-platform-*.tar.gz）
 PKGS=( "${WORKDIR}"/software-distribution-platform-*.tar.gz )
-if [[ ! -e "${PKGS[0]}" ]]; then
+if [[ ${#PKGS[@]} -eq 0 || ! -e "${PKGS[0]}" ]]; then
     echo "错误: ${WORKDIR} 下未找到组件包（software-distribution-platform-*.tar.gz）"
     exit 1
 fi
@@ -79,9 +86,9 @@ run() {  # dry-run 感知的命令执行
     fi
 }
 
-# 可选 registry 登录（提供凭据时执行；否则假定已 docker login）
+# 可选 registry 登录（提供凭据时执行；否则假定已 login）
 if [[ -n "${REGISTRY_USER}" ]]; then
-    run docker login "${REGISTRY%%/*}" -u "${REGISTRY_USER}" -p "${REGISTRY_PASS}"
+    run "${RUNTIME}" login "${REGISTRY%%/*}" -u "${REGISTRY_USER}" -p "${REGISTRY_PASS}"
 fi
 
 # ---------- 主流程：循环处理每个包 ----------
@@ -116,9 +123,9 @@ for pkg in "${PKGS[@]}"; do
     fi
 
     # 2) 上传镜像（load -> tag -> push；push 失败为脚本级错误，终止）
-    run docker load -i "${image_tar}"
-    run docker tag "${longname}:${version}" "${image_ref}"
-    run docker push "${image_ref}"
+    run "${RUNTIME}" load -i "${image_tar}"
+    run "${RUNTIME}" tag "${longname}:${version}" "${image_ref}"
+    run "${RUNTIME}" push "${image_ref}"
 
     # 3) helm3 安装（不加 --wait、不验证部署结果；install 报错仅告警继续下一个包）
     #    chart values: image.imageAddr 为完整镜像引用；模板 namespace 取 values.namespace，与 -n 保持一致

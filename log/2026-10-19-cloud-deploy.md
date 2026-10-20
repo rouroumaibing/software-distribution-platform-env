@@ -40,3 +40,8 @@
 - 镜像推送：`prod-deplyment/run.sh`（组件包 → registry）
 - 网关 yaml：`gateway-harbor-cce.yaml` / `gateway-sdp-cce.yaml`（插件版）；自建版备份在 `gw-backup-2026-10-19/`
 - 遗留：hub 3 个 gin 路由修复文件（variable_group.go / agent_op.go / task_template.go）未 commit
+
+## 20:00 canary 验收（STATUS #10 关闭）
+- e2e-canary.sh 全绿 PASS=9 FAIL=0：release 流水线 → Rollout 步进 → 50% 双版本 2/2 并存 + NodePort 合成流量 18/22 → 快照回流 /releases → 100% 收口 run Succeeded；脚本真源 prod-deplyment/（docs/plans 副本已清理，真源唯一定 env 仓）
+- demo：example 仓 nginx-canary（已去 SDP 化独立案例）v0.0.1/v0.0.2 两版本包构建推 harbor，stable helm 装 sdp-run
+- 平台修复（runner v0.0.6 上云）：①-sdp targetPort env>推断>8080 兜底 ②定时 pause 到时且健康才推进（annotation sdp.io/pause-start）③scaleDeployment 改 merge patch（原 Update 永久撞 RV）④健康探测按 healthCheckInterval 节流（缩放瞬时空窗曾 1 秒计满 3 连败）⑤三份 CRD controller-gen 再生成（status.tasks 缺 rollout 属性被剪，快照回流为空）
