@@ -70,7 +70,7 @@
    - 在 `daemon.json` 加 `"insecure-registries": ["harbor.sdpworkflow.com"]` 并重启 docker；或
    - 把 `cert-build/certs/ca.crt` 安装为系统信任根 CA。
    否则 `docker login / push harbor.sdpworkflow.com` 会因证书不信任失败。
-4. **harbor 凭据**：`admin / Admin@123`（与 `harbor/values.yaml` 的 `adminPassword` 一致）。
+4. **harbor 凭据**：用户名 `admin`，口令由 chart 随机生成 22 位存 Secret（`harbor/values.yaml` 不写死 `adminPassword`，lookup 持久化、helm upgrade 不重置）——部署后从 Secret 取回：`kubectl -n harbor get secret -l app.kubernetes.io/component=core -o jsonpath='{.items[0].data.HARBOR_ADMIN_PASSWORD}' | base64 -d; echo`（完整命令笔记见 `../harbor/harbor-command-guide.txt`）。
 5. **证书**：`harbor.sdpworkflow.com` 的 TLS 证书由 `cert-build/cert-create.sh` 自签生成（SAN `*.sdpworkflow.com`），脚本首次运行会自动生成；可用 `SKIP_GEN_CERTS=1` 强制要求已存在。
 6. **重建集群后**：脚本会自动经 CoreDNS `rewrite` 把 `harbor.sdpworkflow.com` 解析到 harbor 网关 ClusterIP（并前置节点 `/etc/resolv.conf` 指向 CoreDNS、清节点 `/etc/hosts` 陈旧条目），重启 containerd 使 mirror 生效。
 
@@ -91,7 +91,7 @@ cd software-distribution-platform-env/local-kind-dev
 | `VERSION` | `v0.0.1` | 镜像 tag（位置参数同效） |
 | `HARBOR_REGISTRY` | `harbor.sdpworkflow.com` | 仓库域名（443，无端口） |
 | `HARBOR_PROJECT` | `sdp` | harbor 项目名 |
-| `HARBOR_USER` / `HARBOR_PASS` | `admin` / `Admin@123` | 仓库凭据 |
+| `HARBOR_USER` / `HARBOR_PASS` | `admin` / 从 harbor core Secret 取回 | 仓库凭据；harbor 口令由 chart 随机生成（不写死），取回命令见 `../harbor/harbor-command-guide.txt` |
 | `SKIP_AUTH` | 空 | 设任意值则 hub/console 退回 dev 姿态（不开 Keycloak） |
 | `SKIP_GEN_CERTS` | 空 | 设任意值则要求 TLS secret 已存在，缺失即失败 |
 

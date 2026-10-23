@@ -2,10 +2,21 @@
 # e2e-smoke.sh — 按页面真实操作顺序冒烟测试全部前端 API（经 console ingress = 浏览器同路径）。
 # console 走 ClusterIP + ingress（kind 8443->443），自签证书用 curl -k。
 set -u
-# BASE/CURL 可经环境变量覆盖：默认走 console ingress（网关同路径）；
-# 也可指向 hub NodePort 直连（如 BASE="http://localhost:8080/api/v1" CURL="curl -s"），
-# 跳过网关 hostname 匹配，用于 dev/SKIP_AUTH 场景下的功能 CRUD 验证。
-BASE="${BASE:-https://localhost:8443/api/v1}"
+# BASE 解析优先级：显式 BASE > 云端网关探测（www.sdpworkflow.com 可达即采用）> kind 本地默认。
+# 启动预检探活 $BASE/targets，探不通 fail-fast 并打印两种环境用法——防止 15 项全 FAIL 的静默假跑。
+BASE_CLOUD="https://www.sdpworkflow.com/api/v1"
+BASE_KIND="https://localhost:8443/api/v1"
+if [[ -z "${BASE:-}" ]]; then
+    if curl -sk -o /dev/null --max-time 3 "${BASE_CLOUD}/targets"; then
+        BASE="${BASE_CLOUD}"
+    else
+        BASE="${BASE_KIND}"
+    fi
+fi
+if ! curl -sk -o /dev/null --max-time 5 "${BASE}/targets"; then
+    echo "错误: BASE=${BASE} 不可达。云端: BASE=${BASE_CLOUD}；kind 本地: BASE=${BASE_KIND}（或 BASE=http://localhost:8080/api/v1 直连 hub）" >&2
+    exit 1
+fi
 CURL="${CURL:-curl -sk}"
 PASS=0; FAIL=0
 # ---------- 认证（auth ON 环境由脚本动态换取 token，无需人工解析中间输出） ----------

@@ -1,6 +1,6 @@
 # Harbor - bitnamicharts/harbor 27.0.3
 # user: admin
-# 口令策略（2026-10-20 决策）：不写死 adminPassword —— 留空时 chart 默认 adminPassword=""
+口令策略：不写死 adminPassword —— 留空时 chart 默认 adminPassword=""
 # 由 bitnami common.secrets.passwords.manage 随机生成 22 位存 Secret（带 lookup 持久化，helm upgrade
 # 不重置）；部署后从 Secret 取回（见 harbor-command-guide.txt「取回 admin 口令」）。harbor 为周边依赖，已解耦。
 # 经 Envoy 网关（harbor-gateway）暴露为标准 443（https://harbor.sdpworkflow.com，无端口号）。

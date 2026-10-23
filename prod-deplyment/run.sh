@@ -17,6 +17,7 @@ REGISTRY=""                      # 必填：镜像上传目标，如 registry.ex
 KUBECONFIG_PATH=""               # 可选：不传则继承环境 KUBECONFIG
 REGISTRY_USER=""                 # 可选：registry 认证（提供则先 login）
 REGISTRY_PASS=""
+KEYCLOAK_IMAGE=""                # 可选：hub 子 chart 的 keycloak 镜像 repository 覆盖（默认沿用 chart values 的 harbor）
 RUNTIME="nerdctl"                # 镜像操作运行时：nerdctl | docker
 DRY_RUN=0                        # 1 = 只打印将执行的命令，不实际执行
 
@@ -32,6 +33,7 @@ usage() {
   --kubeconfig <path>     指定 kubeconfig，默认继承环境 KUBECONFIG
   --registry-user <u>     可选，registry 认证用户（与 --registry-pass 成对）
   --registry-pass <p>     可选，registry 认证口令
+  --keycloak-image <repo> 可选，覆盖 hub 子 chart 的 keycloak 镜像 repository（tag 沿用 chart 值）
   --runtime <name>        镜像操作运行时 nerdctl|docker，默认 ${RUNTIME}
   --dry-run               只打印将执行的命令，不实际执行
   -h, --help              显示本帮助
@@ -39,6 +41,7 @@ usage() {
 示例:
   ./run.sh --registry harbor.sdpworkflow.com/sdp
   ./run.sh --registry registry.example.com/sdp --runtime docker
+  ./run.sh --registry swr.cn-north-4.myhuaweicloud.com/<project> --keycloak-image swr.cn-north-4.myhuaweicloud.com/<project>/keycloak
   ./run.sh --registry harbor.sdpworkflow.com/sdp --dry-run
 USAGE
 }
@@ -50,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --kubeconfig)     [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; KUBECONFIG_PATH="$2"; shift 2 ;;
         --registry-user)  [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; REGISTRY_USER="$2"; shift 2 ;;
         --registry-pass)  [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; REGISTRY_PASS="$2"; shift 2 ;;
+        --keycloak-image) [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; KEYCLOAK_IMAGE="$2"; shift 2 ;;
         --runtime)        [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; RUNTIME="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -129,15 +133,20 @@ for pkg in "${PKGS[@]}"; do
 
     # 3) helm3 安装（不加 --wait、不验证部署结果；install 报错仅告警继续下一个包）
     #    chart values: image.imageAddr 为完整镜像引用；模板 namespace 取 values.namespace，与 -n 保持一致
+    #    hub 带 keycloak 子 chart，其镜像默认 harbor.sdpworkflow.com/sdp/keycloak；
+    #    --keycloak-image 非空时覆盖 repository（tag 沿用 chart values）。
+    helm_sets=(--set "image.imageAddr=${image_ref}" --set "namespace=${NAMESPACE}")
+    if [[ "${component}" == "hub" && -n "${KEYCLOAK_IMAGE}" ]]; then
+        helm_sets+=(--set "keycloak.image.repository=${KEYCLOAK_IMAGE}")
+    fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "[dry-run] helm install ${component} ${chart_dir} -n ${NAMESPACE} --set image.imageAddr=${image_ref} --set namespace=${NAMESPACE}"
+        echo "[dry-run] helm upgrade --install ${component} ${chart_dir} -n ${NAMESPACE} ${helm_sets[*]}"
     else
-        if helm install "${component}" "${chart_dir}" -n "${NAMESPACE}" \
-               --set "image.imageAddr=${image_ref}" \
-               --set "namespace=${NAMESPACE}" 2>&1 | sed 's/^/[helm] /'; then
-            log "helm install ${component} 已提交（不等待/不验证安装结果）"
+        # upgrade --install：首次=install，重复执行=upgrade（幂等；避免 re-run 报 release 已存在）
+        if helm upgrade --install "${component}" "${chart_dir}" -n "${NAMESPACE}" "${helm_sets[@]}" 2>&1 | sed 's/^/[helm] /'; then
+            log "helm upgrade --install ${component} 已提交（幂等；不等待/不验证安装结果）"
         else
-            warn "helm install ${component} 提交异常（release 已存在或其他错误），继续下一个包"
+            warn "helm upgrade --install ${component} 提交异常（多为 chart 渲染错误），继续下一个包"
         fi
     fi
 

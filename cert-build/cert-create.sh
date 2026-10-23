@@ -4,7 +4,7 @@ set -e
 
 PROJECT_ROOT=$(cd `dirname $0/`;pwd)
 cd ${PROJECT_ROOT}
-COMPONENTS=(console hub harbor)
+COMPONENTS=(console hub harbor hub-keycloak-http)
 NAMESPACE="${NAMESPACE:-sdp-workflow}"
 DOMAINNAME="${DOMAINNAME:-sdpworkflow.com}"
 
@@ -24,6 +24,17 @@ for component in "${COMPONENTS[@]}"; do
                 --from-file=client.key=${component}-client.key \
                 --from-file=client.crt=${component}-client.crt \
                 --dry-run=client -o yaml > ${component}-client-secret.yaml
+        # hub chart 的 keycloak 子 chart 按固定名 hub-keycloak-tls、键位 tls.crt/tls.key
+        # 引用后端证书（挂载点 /etc/keycloak-tls，args 显式 --https-certificate-file）；
+        # SAN 由 service 名 hub-keycloak-http 覆盖 <svc>.<ns>.svc.cluster.local 链，
+        # 与 BackendTLSPolicy 的 validation.hostname 一致。
+        if [[ "${component}" == "hub-keycloak-http" ]]; then
+            kubectl create secret generic hub-keycloak-tls \
+                    --from-file=ca.crt=ca.crt \
+                    --from-file=tls.crt=${component}.crt \
+                    --from-file=tls.key=${component}.key \
+                    --dry-run=client -o yaml > hub-keycloak-tls.yaml
+        fi
         popd
     fi
 done

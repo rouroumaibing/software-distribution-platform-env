@@ -19,9 +19,9 @@
 #     节点拉镜像不经此转发——节点在集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到 harbor 网关 ClusterIP
 #     直达 harbor（与生产「节点经 Gateway 域名拉镜像」一致），不写任何 IP、不依赖宿主进程。
 #
-# 阶段化（2026-10-09）：五段边界 = 部署依赖的自然切面；每段幂等可重入，
+阶段化：五段边界 = 部署依赖的自然切面；每段幂等可重入，
 #   跨段状态（ENVOY_IP 等）经 $STATE_FILE 传递；单段模式面向断点续跑（某段超时/失败，
-#   修复后单独重跑该段即可，无需从头全量）。默认（无 --stage）= 全量部署，行为与阶段化之前一致。
+   修复后单独重跑该段即可，无需从头全量）。默认（无 --stage）= 全量部署。
 #
 # 用法: ./deploy-local.sh [version] [--stage infra|harbor|images|platform|components]
 #       ./deploy-local.sh --help     阶段说明
@@ -51,7 +51,9 @@ HARBOR_REGISTRY="${HARBOR_REGISTRY:-harbor.${SDP_BASE_DOMAIN}}"
 SDP_GATEWAY_DOMAIN="${SDP_GATEWAY_DOMAIN:-www.${SDP_BASE_DOMAIN}}"
 HARBOR_PROJECT="${HARBOR_PROJECT:-sdp}"
 HARBOR_USER="${HARBOR_USER:-admin}"
-HARBOR_PASS="${HARBOR_PASS:-Admin@123}"
+# harbor 口令由 chart 随机生成存 core envvars Secret（harbor/values.yaml 不写死
+# adminPassword）；默认留空，由 ensure_harbor_pass 在 harbor / images 阶段从 Secret 取回。
+HARBOR_PASS="${HARBOR_PASS:-}"
 
 TOKEN="sdp-dev-token-2026"
 log() { echo "[deploy] $*"; }
@@ -253,6 +255,20 @@ ensure_host_hosts() {
 # 直达 harbor，不依赖宿主端口转发 / sudo，与生产「节点经 Gateway 域名访问」一致；harbor_status 仅取 HTTP 状态码）。
 harbor_api() { docker exec "$NODE" curl -s -k -u "${HARBOR_USER}:${HARBOR_PASS}" "$@"; }
 harbor_status() { docker exec "$NODE" curl -s -k -o /dev/null -u "${HARBOR_USER}:${HARBOR_PASS}" -w '%{http_code}' "$@"; }
+# harbor 口令随机生成（不写死）：未显式传 HARBOR_PASS 时从 core envvars Secret 取回，
+# 保证 harbor API 与镜像推送凭据一致；取回失败显式 FATAL，不静默回落空凭据
+#（空凭据的 401 会在下游报成更难定位的推送失败）。
+ensure_harbor_pass() {
+    if [ -z "$HARBOR_PASS" ]; then
+        HARBOR_PASS=$(kubectl -n harbor get secret -l app.kubernetes.io/component=core \
+            -o jsonpath='{.items[0].data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+        if [ -z "$HARBOR_PASS" ]; then
+            log "FATAL: 未能从 harbor core Secret 取回 admin 口令（口令由 chart 随机生成、不写死）——检查 harbor 安装状态，或显式传 HARBOR_PASS"
+            exit 1
+        fi
+        log "harbor admin password retrieved from core secret"
+    fi
+}
 ensure_harbor_project() {
     local code body exists
     body=$(harbor_api "https://${HARBOR_REGISTRY}/api/v2.0/projects?name=${HARBOR_PROJECT}" 2>/dev/null || true)
@@ -290,6 +306,8 @@ ensure_harbor_project() {
 node_push_to_harbor() {
     local src="$1" srcnode name tag harborgw
     [ -n "$src" ] || { log "WARN: node_push_to_harbor 空参数"; return 1; }
+    # 口令可能尚未取回（如 --stage images 单段重跑未经 harbor 阶段）；幂等，已取回则直接返回。
+    ensure_harbor_pass
     # 派生 harbor 仓库名 / tag（取最后一个 / 之后的 basename，再按 : 拆 tag）
     local b="${src##*/}"; tag="${b##*:}"; name="${b%:*}"
     harborgw="harbor.harbor.svc.cluster.local/${HARBOR_PROJECT}/${name}:${tag}"
@@ -298,7 +316,7 @@ node_push_to_harbor() {
     sdp_save "$src" 2>/dev/null | docker exec -i "$NODE" ctr -n k8s.io images import - >/dev/null 2>&1 || true
     # 节点侧按 basename:tag 定位真实 ref（docker save/ctr import 会给无 registry 的本地镜像补 docker.io/library/ 前缀）。
     # 注意：awk 不得用 exit 提前退出——ctr images ls 输出超过管道缓冲(64KB)后，exit 会令上游 ctr
-    # 收到 SIGPIPE(141)，pipefail+set -e 直接杀脚本（2026-10-09 实测三连死因），改用 found 旗标读完整个输入。
+    # 收到 SIGPIPE(141)，pipefail+set -e 直接杀脚本，故读完整个输入再处理（以 found 旗标读完整个输入）。
     srcnode=$(docker exec "$NODE" ctr -n k8s.io images ls 2>/dev/null | awk -v b="${name}:${tag}" '$1 ~ b && !found {print $1; found=1}')
     [ -n "$srcnode" ] || { log "WARN: 源镜像未在节点找到: ${name}:${tag}"; return 1; }
     # 幂等快道：本函数恒先 docker save|ctr import，故比较对象恒反映宿主当前镜像。注意
@@ -545,12 +563,13 @@ stage_harbor() {
     # 节点侧：CoreDNS rewrite harbor.sdpworkflow.com -> 网关 svc 集群 DNS 名（集群内直达，不写 IP）。
     HARBOR_GW_DNS="${HARBOR_ENVOY_SVC}.${HARBOR_ENVOY_NS}.svc.cluster.local"
     ensure_node_dns_harbor "$HARBOR_GW_DNS"
+    ensure_harbor_pass
     ensure_harbor_project
     sdp_login "${HARBOR_REGISTRY}" -u "${HARBOR_USER}" -p "${HARBOR_PASS}" >/dev/null 2>&1 || true
     # 平台依赖镜像先推 harbor（postgres / keycloak），三个组件镜像稍后由本脚本经节点推（build.sh 只构建不推送）
     push_image_to_harbor "postgres:16-alpine"
     push_image_to_harbor "quay.io/keycloak/keycloak:26.7.4"
-    log "harbor ready: https://${HARBOR_REGISTRY} (admin/${HARBOR_PASS})"
+    log "harbor ready: https://${HARBOR_REGISTRY} (admin)"
 }
 
 # ---- 阶段 3/5: images（三组件构建 + 推 harbor） ----
@@ -600,8 +619,10 @@ stage_platform() {
     # 6.5 TLS secret（console-tls / console-ingress-tls）：沿用既有逻辑（console/hub 网关证书），
     #     缺失才用 cert-build 自签兜底；harbor 的 harbor-tls 已在 #3 建好。
     if kubectl -n "$NS" get secret console-tls >/dev/null 2>&1 \
-       && kubectl -n "$NS" get secret console-ingress-tls >/dev/null 2>&1; then
-        log "TLS secrets present (console-tls / console-ingress-tls), reused"
+       && kubectl -n "$NS" get secret console-ingress-tls >/dev/null 2>&1 \
+       && kubectl -n "$NS" get secret hub-tls >/dev/null 2>&1 \
+       && kubectl -n "$NS" get secret hub-keycloak-tls >/dev/null 2>&1; then
+        log "TLS secrets present (console-tls / console-ingress-tls / hub-tls / hub-keycloak-tls), reused"
     elif [ -n "${SKIP_GEN_CERTS:-}" ]; then
         log "FATAL: 缺少 TLS secret 且 SKIP_GEN_CERTS=1"
         exit 1
@@ -624,7 +645,20 @@ stage_platform() {
             --from-file=server.crt="$ENV_DIR/cert-build/certs/console.crt" \
             --from-file=server.key="$ENV_DIR/cert-build/certs/console.key" \
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-        log "TLS secrets created (console-ingress-tls tls-type / console-tls generic 3-key) from self-signed certs"
+        # hub-tls：hub 容器挂 /etc/hub-tls + BackendTLSPolicy CA 校验用，与 console-tls 同构（generic 三 key）。
+        kubectl -n "$NS" create secret generic hub-tls \
+            --from-file=ca.crt="$ENV_DIR/cert-build/certs/ca.crt" \
+            --from-file=server.crt="$ENV_DIR/cert-build/certs/hub.crt" \
+            --from-file=server.key="$ENV_DIR/cert-build/certs/hub.key" \
+            --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        # hub-keycloak-tls：keycloak 容器挂 /etc/keycloak-tls + BackendTLSPolicy CA 校验用；
+        # keycloakx 约定用 tls.crt/tls.key 文件名（见 hub values.yaml 的 keycloak.extraEnv）。
+        kubectl -n "$NS" create secret generic hub-keycloak-tls \
+            --from-file=ca.crt="$ENV_DIR/cert-build/certs/ca.crt" \
+            --from-file=tls.crt="$ENV_DIR/cert-build/certs/hub-keycloak-http.crt" \
+            --from-file=tls.key="$ENV_DIR/cert-build/certs/hub-keycloak-http.key" \
+            --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        log "TLS secrets created (console-ingress-tls / console-tls / hub-tls / hub-keycloak-tls) from self-signed certs"
     fi
 
     # 6.6 sdp-ca：hub 挂载 /etc/sdp-ca/ca.crt 信任自签 harbor/keycloak 证书（cert-build 的 CA）。
@@ -817,7 +851,7 @@ stage_components() {
 
     log "=========================================="
     log "console: https://${SDP_GATEWAY_DOMAIN}:8443  (自签证书 curl -k / 浏览器信任 ca.crt)"
-    log "harbor:  https://${HARBOR_REGISTRY}    (admin/${HARBOR_PASS})"
+    log "harbor:  https://${HARBOR_REGISTRY}    (admin)"
     log "hub:     https://${SDP_GATEWAY_DOMAIN}:8443/api/v1"
     log "集群:    kind sdp-dev | namespace: $NS | 版本: $VERSION"
     log "=========================================="

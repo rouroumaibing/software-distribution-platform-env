@@ -21,6 +21,12 @@
   - `self-signed-ca-cert.sh` 底层 openssl 封装（CA 仅生成一次、跨组件共用）
   - 证书链与消费契约见 `docs/shared/CERTIFICATES.md`
 
+云上生产部署（`prod-deplyment/`）
+- 面向云上托管 K8s（CCE 等）的构建环境就绪与平台部署脚手架，详见 `prod-deplyment/README.md`。
+- `deploy-without-harbor.sh`：云上一键部署（无需安装 harbor）——证书 + TLS secret 前置 → 平台网关 → Envoy proxy 资源收敛 → 默认 SC 预检 → 把组件包直推任意 OCI registry（如 SWR）并 helm 安装。
+- `run.sh`：部署运行入口（组件包 → 推镜像 → helm install），被 `deploy-without-harbor.sh` 委托。
+- `hce-2.0-64bit-*.sh`：CCE 节点环境就绪与「依赖 harbor」的旧部署路径（镜像须先入 harbor）。
+
 本地测试基础设施（yaml；归 `local-kind-dev/deploy/`，随 env 仓一起跟踪）
 - `local-kind-dev/deploy/` 含：
   - `gateway-sdp.yaml`    Gateway 级资源（GatewayClass / EnvoyProxy / Gateway，http / https listener）
@@ -42,7 +48,7 @@
 
 在 k8s 中 helm 部署
 - envoy gateway（chart 本地 vendor 或从 registry 拉）
-- harbor（已落地：集群内 registry，由 `local-kind-dev/deploy-local.sh` 核心步骤安装——harbor 先行于平台组件（脚本 harbor 段）；已纳入 `cert-create.sh` 组件列表，证书名为 `harbor-tls`）
+- harbor（已落地：集群内 registry，由 `local-kind-dev/deploy-local.sh` 核心步骤安装——harbor 先行于平台组件（脚本 harbor 段）；`cert-create.sh` 组件列表含 harbor，产出 `harbor-server-secret` / `harbor-client-secret` 供集群内消费；网关对外 TLS Secret `harbor-tls` 由 `deploy-local.sh` 单独 `create secret tls` 生成）
 - keycloak（已集成到 hub chart，随 hub 安装）
 - cert-manager：**不安装**，证书自导入
 

@@ -8,8 +8,9 @@
 | --- | --- | --- |
 | `centos-stream-9-64bit-env.sh` | CentOS Stream 9 (x86_64) | 通用 ECS 节点：docker + containerd 路线 |
 | `hce-2.0-64bit-env.sh` | Huawei Cloud EulerOS 2.0 (x86_64) | **CCE 托管 K8s 节点**：复用宿主 containerd，走 nerdctl + buildkitd 路线（禁装 docker / containerd.io，会与 CCE 托管 containerd.service 冲突） |
-| `hce-2.0-64bit-deploy.sh` | Huawei Cloud EulerOS 2.0 (x86_64) | **SDP 平台一键部署**：工具检查 → ns/secrets（幂等）→ postgresql → hub/console/runner（组件包）；网关/DNS/验证不在职责内 |
-| `run.sh` | —— | 部署运行入口（组件包 → 推镜像 → helm install） |
+| `hce-2.0-64bit-deploy.sh` | Huawei Cloud EulerOS 2.0 (x86_64) | **SDP 平台一键部署（依赖 harbor）**：工具检查 → ns/secrets（幂等）→ postgresql → hub/console/runner（组件包）；网关/DNS/验证不在职责内 |
+| `deploy-without-harbor.sh` | 任意云 K8s（外部 OCI registry） | **SDP 平台一键部署（无需 harbor）**：证书+4 TLS secret+sdp-ca → 平台网关 → Envoy proxy 资源收敛 → 默认 SC 预检 → 委托 run.sh 把组件包直推任意 OCI registry（如 SWR）并 helm 安装；镜像不必事先入 harbor |
+| `run.sh` | —— | 部署运行入口（组件包 → 推镜像 → helm install）；`deploy-without-harbor.sh` 的前置/推送/安装委托对象 |
 
 ### E2E 验证脚本（云上节点直跑）
 
@@ -43,6 +44,8 @@
 
 ## harbor 自签 CA 与节点分发
 
+> 不走 harbor 时本节整体不适用：若改用 `deploy-without-harbor.sh`（镜像直推 SWR 等外部 registry），节点拉取的是云厂商 registry 或公网镜像，无需信任 harbor 自签 CA；同时只需 `gateway-sdp-cce.yaml`（平台 ELB），`gateway-harbor-cce.yaml` 与 `harbor.sdpworkflow.com` 的内网 DNS 均无需配置。
+
 节点拉 harbor 镜像要求信任 harbor 的自签 CA（根 CA 见 `cert-build/certs/`），这取决于**拉镜像的节点**而非 harbor 所在位置，固定 harbor 节点不能消除该要求。现状方案为 privileged DaemonSet（`harbor-ca-trust`）向所有节点分发 CA 并重启 containerd，缺陷是新节点存在启动竞态。后续根治优先级：
 
 1. **正规 CA 证书**（推荐根治）：网关 TLS 终结处替换为节点已信任的证书（云上托管证书 / 企业 CA 签发），节点无需任何分发。
@@ -67,7 +70,7 @@ buildkitd 读取默认配置 `/etc/buildkit/buildkitd.toml`。docker.io 直连�
 
 ```toml
 [registry."docker.io"]
-  mirrors = ["docker.1panel.live", "dockerproxy.net", "docker.m.daocloud.io", "docker.1ms.run"]
+  mirrors = ["https://docker.1panel.live", "https://dockerproxy.net", "https://docker.m.daocloud.io", "https://docker.1ms.run"]
 ```
 
 > 注意：buildkitd **启动时**读取该文件；若 buildkitd 已在运行，写入后需 `pkill -x buildkitd` 让 build.sh 下次构建时重新拉起才能生效。

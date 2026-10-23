@@ -1,6 +1,6 @@
 # 本地脚手架：平台统一入口（Envoy Gateway）网关级资源 —— 归 local-kind-dev/deploy/（software-distribution-platform-env 仓），**不随 hub/runner/console 三仓打包**。
 #
-# 边界（2026-09-23 拍板）：kind 集群定义、EG controller、本文件的 Gateway 级资源都是
+边界：kind 集群定义、EG controller、本文件的 Gateway 级资源都是
 # "项目外的本地测试基础设施"；三个项目仓（hub/runner/console）互相独立、也独立于根，
 # 各自 chart 只带**自己的** HTTPRoute（按名字引用本文件的 Gateway，名字可 helm --set 覆盖）。
 #
@@ -9,7 +9,7 @@
 #   host 8082 -> port-forward 本地 8082 -> svc 80（网关 http，listener 80）
 #   host 8443 -> port-forward 本地 8443 -> svc 8443（网关 https；curl 用 --resolve www.sdpworkflow.com:8443:127.0.0.1）
 #
-# https listener 端口刻意用 8443 而非 443（2026-09-23，真对接 Keycloak 的裁定）：
+https listener 端口刻意用 8443 而非 443（对接 Keycloak 的网关约定）：
 # issuer/浏览器/hub 三方必须用同一 URL（https://www.sdpworkflow.com:8443/...）。listener 443
 # 会令 X-Forwarded-Port=443、推导/通告的 issuer 丢端口；host 443 映射又须重建 kind 集群。
 # listener 8443 => svc 端口 8443 => X-Forwarded-Port=8443，hub 侧 hostAliases 指 envoy svc
