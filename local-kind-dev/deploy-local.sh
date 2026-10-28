@@ -203,19 +203,22 @@ ensure_kind() {
 # 节点经集群 DNS（CoreDNS）把 ${HARBOR_REGISTRY} 解析到 harbor 网关 ClusterIP，
 # 与生产「节点经 Gateway 域名拉镜像」完全一致：不写任何 IP、不依赖宿主进程。
 # 实现（须在 harbor 网关 EnvoyProxy/数据面 svc 已存在、可取其集群 DNS 名之后调用）：
-#   ① patch kube-system/coredns，注入 rewrite name ${HARBOR_REGISTRY} -> 网关 svc 集群 DNS 名并重启 coredns；
+#   ① patch kube-system/coredns，注入 rewrite name <域名> -> 网关 svc 集群 DNS 名并重启 coredns
+#     （harbor 与 sdp 平台入口两个域名都走这里：hub pod 需经 ${SDP_GATEWAY_DOMAIN} 访问
+#      Keycloak issuer/JWKS，不注入则 hub 对外 401）；
 #   ② 节点 /etc/resolv.conf 前置 CoreDNS（kube-dns 默认 10.96.0.10）；
 #   ③ 节点 /etc/hosts 清除任何 harbor 行（避免陈旧 IP 覆盖 DNS）；④ 重启 containerd 生效。
 patch_coredns_rewrite() {
-    local dns="$1" cm newcm
+    local domain="$1" dns="$2" cm newcm
+    [ -n "$domain" ] && [ -n "$dns" ] || { log "WARN: patch_coredns_rewrite 需要 <域名> <网关svc集群DNS名> 两个参数"; return 1; }
     cm=$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)
     [ -n "$cm" ] || { log "WARN: 读取 coredns Corefile 失败，跳过 rewrite 注入"; return 1; }
-    if echo "$cm" | grep -q "rewrite name ${HARBOR_REGISTRY} $dns"; then
+    if echo "$cm" | grep -q "rewrite name ${domain} $dns"; then
         log "coredns rewrite 已存在 ($dns)"
         return 0
     fi
     # 在 '    ready' 行后插入 rewrite（4 空格缩进，与 Corefile 一致）；通过 stdin 注入新 Corefile。
-    newcm=$(printf '%s\n' "$cm" | awk -v dns="$dns" '{print} /^    ready$/ {print "    rewrite name ${HARBOR_REGISTRY} " dns}')
+    newcm=$(printf '%s\n' "$cm" | awk -v domain="$domain" -v dns="$dns" '{print} /^    ready$/ {print "    rewrite name " domain " " dns}')
     printf '%s\n' "$newcm" \
         | kubectl -n kube-system create cm coredns --from-file=Corefile=/dev/stdin --dry-run=client -o yaml 2>/dev/null \
         | kubectl apply -f - 2>/dev/null \
@@ -227,7 +230,7 @@ patch_coredns_rewrite() {
 ensure_node_dns_harbor() {
     local dns="$1"
     [ -n "$dns" ] || { log "WARN: ensure_node_dns_harbor 未收到网关 svc 集群 DNS 名，跳过节点 DNS 更新"; return 1; }
-    patch_coredns_rewrite "$dns"
+    patch_coredns_rewrite "${HARBOR_REGISTRY}" "$dns"
     # ② 节点 /etc/resolv.conf 前置 CoreDNS（已前置则跳过，避免重复）
     docker exec "$NODE" bash -c "grep -q '^nameserver 10.96.0.10' /etc/resolv.conf || sed -i '1i nameserver 10.96.0.10' /etc/resolv.conf" 2>/dev/null || true
     # ③ 节点 /etc/hosts 清除 harbor 行（grep -v 写临时文件再覆盖，规避 overlay rename 限制）
@@ -704,6 +707,9 @@ stage_platform() {
     done
     ENVOY_IP=$(kubectl -n "$ENVOY_SVC_NS" get "svc/$ENVOY_SVC" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
     log "envoy svc ready ($ENVOY_SVC_NS/$ENVOY_SVC clusterIP=${ENVOY_IP:-<unset>}); host exposed via port-forward 8443:8443 8082:80"
+    # 集群内 pod（hub 校验 JWKS / runner 回连）也要能解析平台入口域名：
+    # CoreDNS rewrite ${SDP_GATEWAY_DOMAIN} -> sdp-gateway envoy svc 集群 DNS 名。
+    patch_coredns_rewrite "${SDP_GATEWAY_DOMAIN}" "${ENVOY_SVC}.${ENVOY_SVC_NS}.svc.cluster.local"
     save_state
 }
 
