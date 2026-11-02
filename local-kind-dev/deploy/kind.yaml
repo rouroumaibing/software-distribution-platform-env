@@ -1,13 +1,16 @@
 # 本地脚手架（归 local-kind-dev/deploy/，software-distribution-platform-env 仓，**不随三仓打包**）：kind 单节点集群定义。
 # 三个项目仓独立于此 —— 集群/registry 都是本地测试基础设施。
-# 端口暴露策略（与生产对齐：gateway/仓库均经域名访问，宿主侧不写死任何节点端口）：
-# - sdp-gateway / harbor-gateway 的数据面服务均为 ClusterIP（不写死端口，生产形态）；
-#   EnvoyProxy CRD v1.6.1 不支持声明 NodePort，故宿主访问统一由 deploy-local.sh 起 kubectl port-forward 暴露：
-#     * sdp-gateway：port-forward 本地 8443->svc 8443（https）、8082->svc 80（http）；
-#       curl -k --resolve www.sdpworkflow.com:8443:127.0.0.1 https://www.sdpworkflow.com:8443 可达。
-#     * harbor-gateway：sudo port-forward 宿主 443->svc 443，仅用于宿主 docker push / 浏览器访问；
-#       节点拉镜像不经此转发——节点在集群内经网关 ClusterIP 直达 harbor（harbor.sdpworkflow.com -> 网关 ClusterIP）。
-# - 不使用 kind extraPortMappings（避免改端口就要 recreate 集群的脆弱耦合）。
+# 端口暴露策略（与生产对齐：gateway/仓库均经域名访问）：
+# - 两条网关数据面 svc 均为 NodePort（EG controller 实测接受 EnvoyProxy type: NodePort 并自动转换；
+#   CRD 无法声明固定 nodePort 值，固定值由 deploy-local.sh 在 svc 创建后幂等 patch，EG 不回改）：
+#     * sdp-gateway：https svc 8443 -> nodePort 31843；http svc 80 -> nodePort 31800
+#     * harbor-gateway：https svc 443 -> nodePort 30443；http svc 80 -> nodePort 31810
+# - 宿主可达统一走 extraPortMappings（docker-proxy 常驻，随集群存活，不依赖任何 pf 进程）：
+#     host 8443 -> 节点 31843（浏览器/curl：--resolve www.sdpworkflow.com:8443:127.0.0.1）
+#     host 8082 -> 节点 31800（网关 http listener）
+#     host 443  -> 节点 30443（harbor：宿主 docker push / 浏览器；节点拉镜像不经宿主，
+#                  集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到网关 ClusterIP 直达）
+#   代价：改宿主端口须重建集群（重建由 images/ 离线缓存 + 幂等部署兜底，可接受）。
 # - containerd mirror：
 #   * localhost:5000 —— 仅作 bootstrap 中转（harbor 自身 bitnamilegacy 镜像、envoy 控制面/数据面镜像、
 #     节点直拉 docker.io 被失效代理挡死，故这些"启动期依赖"经 kind docker 网络里的 kind-registry 中转）。
@@ -15,12 +18,27 @@
 #     走标准 443（mirror key/endpoint 均不带端口）。节点经集群 DNS（CoreDNS rewrite）把 harbor.sdpworkflow.com
 #     解析到 harbor 网关 ClusterIP，在集群内直达 harbor（与生产"节点经 Gateway 域名拉镜像"一致），
 #     不写任何 IP、不经宿主进程、无端口写死。
-# 端口语义与同目录 gateway-sdp.yaml / harbor-gateway.yaml 的 EnvoyProxy 类型成对，改一处须同步另一处。
+# 端口语义与同目录 gateway-sdp.yaml / env/harbor/harbor-gateway.yaml 的 EnvoyProxy 类型成对，改一处须同步另一处。
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: sdp-dev
 nodes:
   - role: control-plane
+    # node 镜像显式固定：kind 默认镜像随二进制版本漂移（v0.20 默认 v1.27.3，v0.29 默认 v1.33.1），
+    # 不固定则换 kind 版本即触发出网拉取（本机出网不稳必卡死）。固定值与 images/ 离线缓存一致，
+    # 本地 docker 有该镜像时 kind 直接用，零出网。
+    image: kindest/node:v1.27.3
+    # extraPortMappings 是 node 级字段（挂 nodes 条目下，非 Cluster 顶层——kind v0.29 顶层解码报 not found）。
+    extraPortMappings:
+      - containerPort: 31843
+        hostPort: 8443
+        protocol: TCP
+      - containerPort: 31800
+        hostPort: 8082
+        protocol: TCP
+      - containerPort: 30443
+        hostPort: 443
+        protocol: TCP
 containerdConfigPatches:
   - |-
     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]

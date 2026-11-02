@@ -4,10 +4,10 @@
 # "项目外的本地测试基础设施"；三个项目仓（hub/runner/console）互相独立、也独立于根，
 # 各自 chart 只带**自己的** HTTPRoute（按名字引用本文件的 Gateway，名字可 helm --set 覆盖）。
 #
-# 数据面服务类型 = ClusterIP（生产形态，零写死端口；EnvoyProxy CRD v1.6.1 不支持声明 NodePort，
-# 宿主访问统一由 deploy-local.sh 起 kubectl port-forward 暴露，不进任何域名/镜像引用）：
-#   host 8082 -> port-forward 本地 8082 -> svc 80（网关 http，listener 80）
-#   host 8443 -> port-forward 本地 8443 -> svc 8443（网关 https；curl 用 --resolve www.sdpworkflow.com:8443:127.0.0.1）
+# 数据面服务类型 = NodePort（EG controller 实测接受 EnvoyProxy type: NodePort 并自动转换 svc；
+# CRD 无法声明固定 nodePort 值，固定值由 deploy-local.sh 在 svc 创建后幂等 patch，实测不回改）：
+#   host 8443 -> extraPortMappings -> 节点 31843 -> svc 8443（https；curl 用 --resolve www.sdpworkflow.com:8443:127.0.0.1）
+#   host 8082 -> extraPortMappings -> 节点 31800 -> svc 80（http listener）
 #
 # https listener 端口刻意用 8443 而非 443（对接 Keycloak 的网关约定）：
 # issuer/浏览器/hub 三方必须用同一 URL（https://www.sdpworkflow.com:8443/...）。listener 443
@@ -44,7 +44,9 @@ spec:
           # EG v1.6.1 出厂配 Envoy distroless-v1.36.x（官方兼容矩阵 v1.6 ↔ v1.36）。
           image: localhost:5000/envoyproxy/envoy:distroless-v1.36.4
       envoyService:
-        type: ClusterIP
+        # NodePort：宿主经 kind extraPortMappings 直达节点端口（链路见文件头）；固定 nodePort
+        # 由 deploy-local.sh patch（CRD 无法声明固定值）。
+        type: NodePort
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway

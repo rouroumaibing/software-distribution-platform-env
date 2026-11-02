@@ -30,7 +30,7 @@
 - **镜像流转**：
   - `localhost:5000` **仅**承接 harbor 自身镜像（`bitnamilegacy/*`）与 envoy 控制面/数据面镜像——这些是 harbor 还没起来、节点又拉不动 `docker.io` 时的 bootstrap 源，**任何平台 pod 都不从它拉镜像**。
   - `harbor.sdpworkflow.com/sdp/*` 是 hub / runner / console / keycloak / postgres 的唯一仓库，全部经网关 443 拉取。
-- **节点拉 harbor 的链路（与生产一致：节点经 Gateway 域名拉镜像）**：kind 节点 containerd 配 `harbor.sdpworkflow.com` mirror（insecure_skip_verify + basic auth）→ 节点 `/etc/resolv.conf` 前置 CoreDNS（10.96.0.10）→ CoreDNS 经 `rewrite name harbor.sdpworkflow.com` 把域名解析到 **harbor 网关 ClusterIP** → 节点在集群内直达 harbor 的 envoy 数据面 svc。`harbor.sdpworkflow.com` 不写任何 IP、不依赖宿主任何进程（宿主 port-forward 443 仅供宿主 `docker push` / 浏览器）。镜像拉取路径全程不带端口、零改动。
+- **节点拉 harbor 的链路（与生产一致：节点经 Gateway 域名拉镜像）**：kind 节点 containerd 配 `harbor.sdpworkflow.com` mirror（insecure_skip_verify + basic auth）→ 节点 `/etc/resolv.conf` 前置 CoreDNS（10.96.0.10）→ CoreDNS 经 `rewrite name harbor.sdpworkflow.com` 把域名解析到 **harbor 网关 ClusterIP** → 节点在集群内直达 harbor 的 envoy 数据面 svc。`harbor.sdpworkflow.com` 不写任何 IP、不依赖宿主任何进程（宿主 443 经 extraPortMappings -> NodePort 30443，仅供宿主 `docker push` / 浏览器）。镜像拉取路径全程不带端口、零改动。
 
 ---
 
@@ -40,13 +40,13 @@
 
 | 域名 | 用途 | 暴露方式 |
 |------|------|----------|
-| `https://harbor.sdpworkflow.com` | 镜像仓库（平台镜像唯一仓库） | 宿主 `sudo kubectl port-forward 443:443`（harbor envoy ClusterIP svc，仅供宿主 docker push / 浏览器）；**节点不经此转发**，节点经集群 DNS（CoreDNS rewrite）解析到网关 ClusterIP 在集群内直达 |
-| `https://www.sdpworkflow.com:8443` | 平台入口（console / keycloak / hub API） | 宿主 `kubectl port-forward 8443:8443 8082:80`（sdp envoy ClusterIP svc） |
+| `https://harbor.sdpworkflow.com` | 镜像仓库（平台镜像唯一仓库） | 宿主 443 → kind extraPortMappings → 节点 30443（NodePort，仅供宿主 docker push / 浏览器）；**节点不经宿主**，节点经集群 DNS（CoreDNS rewrite）解析到网关 ClusterIP 在集群内直达 |
+| `https://www.sdpworkflow.com:8443` | 平台入口（console / keycloak / hub API） | 宿主 8443/8082 → kind extraPortMappings → 节点 31843/31800（NodePort）→ svc 8443/80 |
 
 > sdp 网关仍用 `:8443`（2026-09-23 既定：与 Keycloak issuer / 浏览器访问端口三方一致）。
 > 若要 sdp 也改 443，需把两个网关合并为一个 Envoy 并修正 TLS secret 命名（`console-ingress-tls` 当前由 gateway 引用、但 cert 脚本产出的是 `console-server-secret`），属于独立一轮改造，**本脚手架未做**。
 
-网关数据面**均为 ClusterIP、不写死端口**（harbor / sdp 各一套独立 GatewayClass + EnvoyProxy）；**端口号不进任何域名/镜像引用**。宿主访问统一由 `deploy-local.sh` 起 `kubectl port-forward` 暴露（不使用 kind `extraPortMappings`，避免改端口就要 recreate 集群）。停转发用 `./stop-dev.sh kill`。
+网关数据面 svc **均为 NodePort、固定端口**（harbor / sdp 各一套独立 GatewayClass + EnvoyProxy；EG 实测接受 `type: NodePort` 并自动转换 svc，CRD 无法声明固定 nodePort 值——固定值由 `deploy-local.sh` 在 svc 创建后幂等 patch，实测不回改）；**端口号不进任何域名/镜像引用**。宿主访问统一走 kind `extraPortMappings`（docker-proxy 常驻、随集群存活，不依赖任何 port-forward 进程；改宿主端口须重建集群，由 images/ 离线缓存兜底）。
 
 ---
 
@@ -108,7 +108,7 @@ cd software-distribution-platform-env/local-kind-dev
 - **harbor-gateway kubectl 客户端校验失败**：`v1 Gateway spec.parametersRef` 服务端支持，但旧版
   kubectl 客户端内置 schema 不认 → apply 报 `unknown field`。两个 Gateway apply 均带 `--validate=false` 绕开。
 - **节点拉 harbor 失败**：检查节点 `docker exec sdp-dev-control-plane getent hosts harbor.sdpworkflow.com` 是否解析到 harbor 网关 ClusterIP（经 CoreDNS）；必要时 `kubectl -n kube-system rollout restart deployment/coredns` 并 `docker exec ... systemctl restart containerd`。
-- **harbor 网关不通**：确认 `deploy-local.sh` 已起 `sudo kubectl port-forward 443:443`（harbor envoy svc，绑定 0.0.0.0），且宿主 `443` 可达（`curl -sk https://harbor.sdpworkflow.com/api/v2.0/health`）；若转发进程被 kill，重新跑 `./deploy-local.sh` 或手工 `sudo kubectl -n harbor port-forward --address 0.0.0.0 svc/<harbor-envoy> 443:443`。
+- **harbor 网关不通**：确认 svc NodePort 已固定为 30443（`kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-name=harbor-gateway -o jsonpath='{.items[0].spec.ports}'`），且宿主 `443` 可达（`curl -sk https://harbor.sdpworkflow.com/api/v2.0/health`，走 extraPortMappings -> 节点 30443）；若 nodePort 飘回随机值，重跑 `./deploy-local.sh`（幂等 patch 会固定回 30443）。
 - **postgres / keycloak 镜像未进 harbor**：脚本在 harbor 就绪后自动 `push_image_to_harbor postgres:16-alpine` 与 `quay.io/keycloak/keycloak:26.7.4`；若跳过，pod 会 ImagePullBackOff。
 - **（macOS Docker Desktop）宿主 `docker push` 可能连不上 host 侧 port-forward**：Docker Desktop 的 docker daemon 运行在独立 VM，与宿主 shell 的 `127.0.0.1` 不互通，导致 `docker push harbor.sdpworkflow.com/...`（经宿主 `/etc/hosts` + port-forward 443）报 `connection refused`。若遇此情况，可改用集群内推送（节点 `ctr images push --skip-verify --plain-http --user admin:Admin@123 harbor.harbor.svc.cluster.local/sdp/<img>:<tag>`，多架构镜像按 digest 推送单架构），或把 harbor 网关临时暴露为节点可达地址。脚本当前仍用宿主 docker push（与既往全量测试一致），请按本机环境验证。
 - **sdp 网关 https 未 Programmed**：依赖 `console-ingress-tls`（网关引用名）已存在；若缺失，需确认 `cert-build` 产出与该命名的 secret 对齐（当前为已知历史不一致，未在本轮处理）。

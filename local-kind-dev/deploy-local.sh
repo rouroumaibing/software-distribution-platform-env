@@ -11,17 +11,18 @@
 #   5) postgres / keycloak / hub / runner / console 全部从 harbor 拉镜像部署。
 #
 # 端口约定：所有「域名访问」走标准 443（https://harbor.sdpworkflow.com、https://www.sdpworkflow.com:8443）。
-#   网关数据面均为 ClusterIP（不写死端口）；宿主访问统一由本脚本起 kubectl port-forward 暴露，
-#   端口号不进任何域名/镜像引用：
-#   - sdp-gateway：port-forward 本地 8443 -> svc 8443（https listener 8443，与 issuer/浏览器端口三方一致，
-#     2026-09-23 裁定）、8082 -> svc 80（http）；curl 用 --resolve www.sdpworkflow.com:8443:127.0.0.1。
-#   - harbor-gateway：sudo port-forward 宿主 443 -> svc 443（仅供宿主 docker push / 浏览器）；
-#     节点拉镜像不经此转发——节点在集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到 harbor 网关 ClusterIP
+#   网关数据面 svc 为 NodePort（固定值由本脚本在 svc 创建后幂等 patch；EG 实测接受 type: NodePort
+#   且不回改 patch 的 nodePort）；宿主访问统一走 kind extraPortMappings（docker-proxy 常驻、随集群
+#   存活，不依赖任何 port-forward 进程），端口号不进任何域名/镜像引用：
+#   - sdp-gateway：host 8443 -> 节点 31843 -> svc 8443（https listener 8443，与 issuer/浏览器端口三方一致，
+#     2026-09-23 裁定）、host 8082 -> 节点 31800 -> svc 80（http）；curl 用 --resolve www.sdpworkflow.com:8443:127.0.0.1。
+#   - harbor-gateway：host 443 -> 节点 30443 -> svc 443（仅供宿主 docker push / 浏览器）；
+#     节点拉镜像不经宿主——节点在集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到 harbor 网关 ClusterIP
 #     直达 harbor（与生产「节点经 Gateway 域名拉镜像」一致），不写任何 IP、不依赖宿主进程。
 #
-阶段化：五段边界 = 部署依赖的自然切面；每段幂等可重入，
+# 阶段化：五段边界 = 部署依赖的自然切面；每段幂等可重入，
 #   跨段状态（ENVOY_IP 等）经 $STATE_FILE 传递；单段模式面向断点续跑（某段超时/失败，
-   修复后单独重跑该段即可，无需从头全量）。默认（无 --stage）= 全量部署。
+#   修复后单独重跑该段即可，无需从头全量）。默认（无 --stage）= 全量部署。
 #
 # 用法: ./deploy-local.sh [version] [--stage infra|harbor|images|platform|components]
 #       ./deploy-local.sh --help     阶段说明
@@ -49,6 +50,11 @@ NS="sdp-workflow"
 SDP_BASE_DOMAIN="${SDP_BASE_DOMAIN:-sdpworkflow.com}"
 HARBOR_REGISTRY="${HARBOR_REGISTRY:-harbor.${SDP_BASE_DOMAIN}}"
 SDP_GATEWAY_DOMAIN="${SDP_GATEWAY_DOMAIN:-www.${SDP_BASE_DOMAIN}}"
+# 本地/集群内通信禁用外部代理：本 agent 沙箱会向 kind 节点容器注入 HTTP_PROXY，宿主 shell 亦可能
+# 带代理；curl 命中代理会把 ClusterIP / 127.0.0.1 请求转给不存在的代理端口（127.0.0.1:54320）导致
+# HTTP 000。本地与集群域名走直连，外部下载（helm）仍走代理。
+export no_proxy="127.0.0.1,localhost,${HARBOR_REGISTRY},${SDP_GATEWAY_DOMAIN},.svc,.svc.cluster.local,.cluster.local"
+export NO_PROXY="$no_proxy"
 HARBOR_PROJECT="${HARBOR_PROJECT:-sdp}"
 HARBOR_USER="${HARBOR_USER:-admin}"
 # harbor 口令由 chart 随机生成存 core envvars Secret（harbor/values.yaml 不写死
@@ -88,7 +94,7 @@ STAGE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         stop)
-            echo "网关经 kubectl port-forward 暴露（sdp 8443 + harbor sudo 443），停止转发请运行: ./stop-dev.sh kill"
+            echo "网关经宿主端口映射直达（kind extraPortMappings：8443/8082/443 随集群常驻），无需 port-forward"
             exit 0
             ;;
         --stage)
@@ -225,7 +231,7 @@ patch_coredns_rewrite() {
         || { log "WARN: 注入 coredns rewrite 失败（节点可能无法经 DNS 解析 harbor，将影响镜像拉取）"; return 1; }
     kubectl -n kube-system rollout restart deployment/coredns 2>/dev/null
     kubectl -n kube-system rollout status deployment/coredns --timeout=120s 2>/dev/null || true
-    log "coredns rewrite 注入 -> $dns，coredns 已重启"
+    log "coredns rewrite 注入 -> ${dns}，coredns 已重启"
 }
 ensure_node_dns_harbor() {
     local dns="$1"
@@ -248,7 +254,7 @@ ensure_host_hosts() {
             if sudo sh -c "echo '$entry' >> /etc/hosts" 2>/dev/null; then
                 log "host /etc/hosts appended: $entry"
             else
-                log "WARN: 未能写入 host /etc/hosts（$entry）—— 请手工添加，否则 docker push / 浏览器访问 ${HARBOR_REGISTRY} 失败"
+                log "WARN: 未能写入 host /etc/hosts（${entry}）—— 请手工添加，否则 docker push / 浏览器访问 ${HARBOR_REGISTRY} 失败"
             fi
         fi
     done
@@ -256,8 +262,8 @@ ensure_host_hosts() {
 
 # harbor HTTP API（经集群节点访问：节点经 CoreDNS 把 harbor.sdpworkflow.com 解析到网关 ClusterIP
 # 直达 harbor，不依赖宿主端口转发 / sudo，与生产「节点经 Gateway 域名访问」一致；harbor_status 仅取 HTTP 状态码）。
-harbor_api() { docker exec "$NODE" curl -s -k -u "${HARBOR_USER}:${HARBOR_PASS}" "$@"; }
-harbor_status() { docker exec "$NODE" curl -s -k -o /dev/null -u "${HARBOR_USER}:${HARBOR_PASS}" -w '%{http_code}' "$@"; }
+harbor_api() { docker exec "$NODE" curl -s -k --noproxy '*' -u "${HARBOR_USER}:${HARBOR_PASS}" "$@"; }
+harbor_status() { docker exec "$NODE" curl -s -k --noproxy '*' -o /dev/null -u "${HARBOR_USER}:${HARBOR_PASS}" -w '%{http_code}' "$@"; }
 # harbor 口令随机生成（不写死）：未显式传 HARBOR_PASS 时从 core envvars Secret 取回，
 # 保证 harbor API 与镜像推送凭据一致；取回失败显式 FATAL，不静默回落空凭据
 #（空凭据的 401 会在下游报成更难定位的推送失败）。
@@ -302,34 +308,56 @@ ensure_harbor_project() {
 #   背景：宿主 docker push harbor.sdpworkflow.com 在 macOS Docker Desktop 下因 daemon 跑在独立 VM、
 #   无法访问宿主 loopback 的 port-forward 443 而失败；因此把镜像灌入节点 containerd，由节点经
 #   harbor 内部服务（harbor.harbor.svc.cluster.local:80，无 TLS）推送。
-#   - 宿主 docker save | 节点 ctr import 注入节点（自定义构建镜像 / 已拉取到宿主的上游镜像均适用）；
+#   - 镜像入节点主路径：宿主 docker push -> 本地 kind-registry(localhost:5000)，节点 ctr pull
+#     --plain-http（containerd 正确协商 amd64 平台，规避 docker save 多架构 index 缺 blob 的导入陷阱）；
 #   - 节点 ctr tag -> harbor 内部仓库路径，ctr push --platform linux/amd64 --plain-http --skip-verify。
 #   参数 $1 = 宿主镜像引用（postgres:16-alpine / quay.io/keycloak/keycloak:26.7.4 /
 #         software-distribution-platform-hub:v0.0.1）；目标 = harbor.sdpworkflow.com/${HARBOR_PROJECT}/<basename>。
 node_push_to_harbor() {
     local src="$1" srcnode name tag harborgw
     [ -n "$src" ] || { log "WARN: node_push_to_harbor 空参数"; return 1; }
-    # 口令可能尚未取回（如 --stage images 单段重跑未经 harbor 阶段）；幂等，已取回则直接返回。
     ensure_harbor_pass
     # 派生 harbor 仓库名 / tag（取最后一个 / 之后的 basename，再按 : 拆 tag）
     local b="${src##*/}"; tag="${b##*:}"; name="${b%:*}"
     harborgw="harbor.harbor.svc.cluster.local/${HARBOR_PROJECT}/${name}:${tag}"
     log "node-push: $src -> $harborgw (经节点 containerd)"
-    # 宿主 save（按运行时：docker / nerdctl --format docker）| 节点 import（多架构 index 可能报 missing blob，但 amd64 manifest 已就绪，忽略非零）
-    sdp_save "$src" 2>/dev/null | docker exec -i "$NODE" ctr -n k8s.io images import - >/dev/null 2>&1 || true
-    # 节点侧按 basename:tag 定位真实 ref（docker save/ctr import 会给无 registry 的本地镜像补 docker.io/library/ 前缀）。
-    # 注意：awk 不得用 exit 提前退出——ctr images ls 输出超过管道缓冲(64KB)后，exit 会令上游 ctr
-    # 收到 SIGPIPE(141)，pipefail+set -e 直接杀脚本，故读完整个输入再处理（以 found 旗标读完整个输入）。
-    srcnode=$(docker exec "$NODE" ctr -n k8s.io images ls 2>/dev/null | awk -v b="${name}:${tag}" '$1 ~ b && !found {print $1; found=1}')
+
+    # 入节点主路径：宿主推 kind-registry(localhost:5000) -> 节点 ctr pull（平台协商，多架构安全）。
+    # 仅当 kind-registry 不可用时兜底退回 docker save|ctr import（单平台镜像可用，多架构可能缺 blob）。
+    if docker inspect kind-registry >/dev/null 2>&1; then
+        local dst="localhost:5000/${name}:${tag}"
+        sdp_inspect "$dst" >/dev/null 2>&1 || sdp_tag "$src" "$dst"
+        if sdp_push -q "$dst" >/dev/null 2>&1; then
+            local rgip
+            rgip=$(docker inspect kind-registry --format \
+                '{{range $k,$v := .NetworkSettings.Networks}}{{if ne $k "bridge"}}{{$v.IPAddress}}{{end}}{{end}}' 2>/dev/null | tr -d ' ')
+            if [ -n "$rgip" ]; then
+                srcnode="${rgip}:5000/${name}:${tag}"
+                if ! docker exec "$NODE" ctr -n k8s.io images pull --plain-http "$srcnode" >/dev/null 2>&1; then
+                    log "WARN: 节点从 kind-registry 拉取失败: $srcnode"
+                    srcnode=""
+                fi
+            fi
+        else
+            log "WARN: 宿主推 kind-registry 失败: $dst"
+        fi
+    fi
+    if [ -z "$srcnode" ]; then
+        # 兜底：docker save | ctr import（单平台镜像可用；多架构 index 可能报 missing blob，忽略非零）
+        sdp_save "$src" 2>/dev/null | docker exec -i "$NODE" ctr -n k8s.io images import - >/dev/null 2>&1 || true
+        # 节点侧按 basename:tag 定位真实 ref（docker save/ctr import 会给无 registry 的本地镜像补 docker.io/library/ 前缀）。
+        # 注意：awk 不得用 exit 提前退出——ctr images ls 输出超过管道缓冲(64KB)后，exit 会令上游 ctr
+        # 收到 SIGPIPE(141)，pipefail+set -e 直接杀脚本，故读完整个输入再处理（以 found 旗标读完整个输入）。
+        srcnode=$(docker exec "$NODE" ctr -n k8s.io images ls 2>/dev/null | awk -v b="${name}:${tag}" '$1 ~ b && !found {print $1; found=1}')
+    fi
     [ -n "$srcnode" ] || { log "WARN: 源镜像未在节点找到: ${name}:${tag}"; return 1; }
-    # 幂等快道：本函数恒先 docker save|ctr import，故比较对象恒反映宿主当前镜像。注意
-    # ctr push --platform amd64 之后 harbor tag 存的是 amd64 子 manifest 的 digest（非 index），
-    # 故优先从节点侧 <ref>@sha256:* 平台子引用取 amd64 manifest digest 与之比较（取不到或
-    # 不一致则回退全量推送，安全兜底）。组件镜像重建后 digest 变化不命中，不会误跳过。
+
+    # 幂等快道：harbor 已有同 digest 镜像则跳过推送（节省时间；组件镜像重建后 digest 变化不命中会自动重推）。
+    # 注意：awk 不得用 exit 提前退出（SIGPIPE 141 陷阱，见下方兜底分支注释），以 found 旗标读完整个输入。
     local src_digest remote_digest
     src_digest=$(docker exec "$NODE" ctr -n k8s.io images ls 2>/dev/null \
-        | awk -v p="$srcnode@" 'index($1, p)==1 && $2 ~ /manifest/ && $2 !~ /index/ && $2 !~ /list/ && $0 ~ /linux\/amd64/ && !found {sub(/.*@/,"",$1); print $1; found=1}')
-    remote_digest=$(docker exec "$NODE" curl -s -D - -o /dev/null \
+        | awk -v r="$srcnode" '$1==r && $2 ~ /manifest/ && $2 !~ /index/ && $2 !~ /list/ && $0 ~ /linux\/amd64/ && !found {print $3; found=1}')
+    remote_digest=$(docker exec "$NODE" curl -s --noproxy '*' -D - -o /dev/null \
         -u "${HARBOR_USER}:${HARBOR_PASS}" \
         -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
         "http://harbor.harbor.svc.cluster.local/v2/${HARBOR_PROJECT}/${name}/manifests/${tag}" 2>/dev/null \
@@ -349,7 +377,7 @@ node_push_to_harbor() {
             --user "${HARBOR_USER}:${HARBOR_PASS}" "$harborgw" >/dev/null 2>&1; then
         log "pushed ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${name}:${tag} (via node)"
     else
-        log "WARN: 节点推 harbor 失败: $harborgw（可能 harbor 未就绪 / 凭据错）"
+        log "WARN: 节点推 harbor 失败: ${harborgw}（可能 harbor 未就绪 / 凭据错）"
         return 1
     fi
 }
@@ -523,9 +551,9 @@ stage_harbor() {
         curl -s localhost:5000/v2/_catalog 2>/dev/null | sed 's/^/    | /' || echo "    | (无法连接 localhost:5000，bootstrap registry 可能未起)"
         set -e
     fi
-    # harbor 网关（独立 EnvoyProxy harbor-eg，type: ClusterIP：与生产形态一致、零写死端口）。
-    # 宿主侧由 sudo kubectl port-forward 443:443 暴露，仅供宿主 docker push / 浏览器访问；
-    # 节点拉镜像不经此转发——节点在集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到网关 ClusterIP 直达 harbor。
+    # harbor 网关（独立 EnvoyProxy harbor-eg，type: NodePort）。
+    # 宿主侧经 kind extraPortMappings host 443 -> 节点 30443 直达，仅供宿主 docker push / 浏览器访问；
+    # 节点拉镜像不经宿主——节点在集群内经 CoreDNS 把 harbor.sdpworkflow.com 解析到网关 ClusterIP 直达 harbor。
     kubectl apply -f "$HARBOR_DIR/harbor-gateway.yaml" --validate=false
     # 等待 harbor-gateway 的 envoy 数据面 svc 创建（harbor 未 Ready 时 Gateway 不会 Programmed，svc 不会及时出现）。
     # jsonpath 在 svc 集合为空时以非零退出，set -e 下会直接杀脚本 -> 必须挂 || true（2026-10-09 实测踩雷修复）。
@@ -541,13 +569,12 @@ stage_harbor() {
         log "FATAL: 未找到 harbor-gateway envoy svc（请检查 EG controller 与 Gateway 状态）"
         exit 1
     fi
-    # 宿主 port-forward 暴露 harbor 443（sudo 绑标准 443，仅供宿主 docker push / 浏览器；
-    # 节点侧不依赖此转发，节点经 CoreDNS 解析 harbor.sdpworkflow.com -> 网关 ClusterIP 在集群内直达）。
-    sudo kubectl -n "$HARBOR_ENVOY_NS" port-forward --address 0.0.0.0 "svc/$HARBOR_ENVOY_SVC" 443:443 \
-        >/dev/null 2>&1 &
-    HARBOR_PF_PID=$!
-    disown "$HARBOR_PF_PID" 2>/dev/null || true
-    # 等待 port-forward 生效（harbor 健康端点可达）
+    # 固定 nodePort：EG 从 CRD 无法声明固定 nodePort 值，svc 由 EG 创建时落随机端口，须 patch 成
+    # kind.yaml extraPortMappings 对应的 30443/31810（实测 EG 不回改）。幂等：重复 patch 同值无副作用。
+    # 注意 kube-proxy 同步有秒级延迟，patch 后下方健康检查循环自带重试窗口。
+    kubectl -n "$HARBOR_ENVOY_NS" patch "svc/$HARBOR_ENVOY_SVC" --type=merge \
+        -p '{"spec":{"ports":[{"name":"http-80","port":80,"protocol":"TCP","nodePort":31810},{"name":"https-443","port":443,"protocol":"TCP","nodePort":30443}]}}' >/dev/null
+    # 等待宿主 443 可用（extraPortMappings -> 节点 30443 -> svc；harbor 健康端点可达）
     for i in $(seq 1 30); do
         if curl -s -k --resolve "${HARBOR_REGISTRY}:443:127.0.0.1" "https://${HARBOR_REGISTRY}/api/v2.0/health" \
             >/dev/null 2>&1; then
@@ -555,7 +582,7 @@ stage_harbor() {
         fi
         sleep 3
     done
-    log "harbor-gateway: 宿主 port-forward 443:443 (pid=$HARBOR_PF_PID, 仅供 docker push/浏览器); 节点经 CoreDNS 解析在集群内直达"
+    log "harbor-gateway: 宿主经 extraPortMappings 443 -> nodePort 30443 直达（无 port-forward）; 节点经 CoreDNS 解析在集群内直达"
     # 等 harbor 网关就绪（Envoy 数据面 Programmed）后再建项目 / 推镜像。
     # condition type 须为 Programmed（Gateway API 标准条件是 Accepted/Programmed，没有 Ready——
     # 2026-10-09 实测：写成 Ready 永不匹配，该循环每次固定烧满 30×5s=150s）。
@@ -692,12 +719,12 @@ stage_platform() {
         log "FATAL: sdp-gateway envoy proxy svc 未创建（请检查 EG controller 与 Gateway 状态）"
         exit 1
     fi
-    # 宿主 port-forward 暴露 sdp-gateway（ClusterIP，不写死端口）：本地 8443->svc 8443（https）、8082->svc 80（http）。
-    # 绑定 127.0.0.1（仅宿主/浏览器经 --resolve 访问；集群内 pod 走 ClusterIP DNS，不经此处）。
-    kubectl -n "$ENVOY_SVC_NS" port-forward "svc/$ENVOY_SVC" 8443:8443 8082:80 \
-        >/dev/null 2>&1 &
-    disown $! 2>/dev/null || true
-    # 等待本地 8443 可用
+    # 固定 nodePort：EG 从 CRD 无法声明固定 nodePort 值，svc 由 EG 创建时落随机端口，须 patch 成
+    # kind.yaml extraPortMappings 对应的 31800/31843（实测 EG 不回改）。幂等：重复 patch 同值无副作用。
+    # 注意 kube-proxy 同步有秒级延迟，patch 后下方健康检查循环自带重试窗口。
+    kubectl -n "$ENVOY_SVC_NS" patch "svc/$ENVOY_SVC" --type=merge \
+        -p '{"spec":{"ports":[{"name":"http-80","port":80,"protocol":"TCP","nodePort":31800},{"name":"https-8443","port":8443,"protocol":"TCP","nodePort":31843}]}}' >/dev/null
+    # 等待宿主 8443 可用（extraPortMappings -> 节点 31843 -> svc）
     for i in $(seq 1 30); do
         if curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 "https://${SDP_GATEWAY_DOMAIN}:8443/" \
             >/dev/null 2>&1; then
@@ -706,7 +733,7 @@ stage_platform() {
         sleep 2
     done
     ENVOY_IP=$(kubectl -n "$ENVOY_SVC_NS" get "svc/$ENVOY_SVC" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
-    log "envoy svc ready ($ENVOY_SVC_NS/$ENVOY_SVC clusterIP=${ENVOY_IP:-<unset>}); host exposed via port-forward 8443:8443 8082:80"
+    log "envoy svc ready ($ENVOY_SVC_NS/$ENVOY_SVC clusterIP=${ENVOY_IP:-<unset>}); host exposed via extraPortMappings 8443->31843 8082->31800"
     # 集群内 pod（hub 校验 JWKS / runner 回连）也要能解析平台入口域名：
     # CoreDNS rewrite ${SDP_GATEWAY_DOMAIN} -> sdp-gateway envoy svc 集群 DNS 名。
     patch_coredns_rewrite "${SDP_GATEWAY_DOMAIN}" "${ENVOY_SVC}.${ENVOY_SVC_NS}.svc.cluster.local"
@@ -714,6 +741,61 @@ stage_platform() {
 }
 
 # ---- 阶段 5/5: components（hub/runner/console 部署 + target 注册 + 握手验证） ----
+# ---------- KC26 内置缺陷补丁（幂等）：account client 补 aud=account audience mapper ----------
+# 自动创建的 `account` client 没有 aud=account 的 audience mapper（roles scope 的
+# audience-resolve 会排除 token 自身 client），account 控制台自身 token aud=null →
+# 其全部 REST API 401，浏览器症状为控制台顶部 "Server responded with an invalid
+# status" 红条。经 master admin API 查重后补；已存在则跳过（mapper 落 DB，KC 重启不丢）。
+patch_account_audience() {
+    local base="https://${SDP_GATEWAY_DOMAIN}:8443/keycloak"
+    local mt auuid code mlist
+    mt=$(curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 --max-time 10 \
+        "$base/realms/master/protocol/openid-connect/token" \
+        -d grant_type=password -d client_id=admin-cli \
+        -d username=admin -d password='sdp@12345' 2>/dev/null \
+        | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p') || true
+    if [ -z "$mt" ]; then
+        log "WARN: master admin token 获取失败，跳过 account audience 补丁（account 控制台将不可用）"
+        return 0
+    fi
+    auuid=$(curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 --max-time 10 \
+        -H "Authorization: Bearer $mt" \
+        "$base/admin/realms/sdp/clients?clientId=account" 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(d[0]["id"] if d else "")
+except Exception:
+    pass') || true
+    if [ -z "${auuid:-}" ]; then
+        log "WARN: account client 未找到，跳过 audience 补丁"
+        return 0
+    fi
+    local exists="n"
+    exists=$(curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 --max-time 10 \
+        -H "Authorization: Bearer $mt" \
+        "$base/admin/realms/sdp/clients/$auuid/protocol-mappers/models" 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    ms=json.load(sys.stdin)
+    print("y" if any(m.get("name")=="account audience" for m in ms) else "n")
+except Exception:
+    print("n")') || true
+    if [ "$exists" = "y" ]; then
+        log "account audience mapper 已存在（幂等跳过）"
+        return 0
+    fi
+    code=$(curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 --max-time 10 \
+        -o /dev/null -w '%{http_code}' \
+        -X POST -H "Authorization: Bearer $mt" -H "Content-Type: application/json" \
+        -d '{"name":"account audience","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","consentRequired":false,"config":{"included.client.audience":"account","access.token.claim":"true"}}' \
+        "$base/admin/realms/sdp/clients/$auuid/protocol-mappers/models" 2>/dev/null) || code="000"
+    if [ "$code" = "201" ]; then
+        log "account audience mapper 已补（KC26.7.4 内置缺陷，缺它 account 控制台 API 全 401）"
+    else
+        log "WARN: account audience mapper 创建失败 (HTTP $code) —— account 控制台将不可用，重跑本段可补"
+    fi
+}
+
 stage_components() {
     if [ -z "${ENVOY_IP:-}" ]; then load_state; fi
     require_state "${ENVOY_IP:-}" ENVOY_IP platform
@@ -745,29 +827,27 @@ stage_components() {
     fi
     log "hub ready"
 
+    # 8.5 account 控制台可用性补丁（幂等，见函数头注释）
+    if [ -z "${SKIP_AUTH:-}" ]; then
+        patch_account_audience
+    fi
+
     # 9. 注册接入目标（幂等）。auth ON：先经 sdp-console password grant（admin 用户）换 token，
     #    再带 Bearer 注册 —— hub 侧 POST /targets 无 RBAC 门槛（main.go M1 wiring），
     #    部署后 target 即就位，runner 握手无需人工登录 console 建目标。
-    #    访问面自管：宿主 8443 已有转发（platform 段 pf）则复用；否则本段自起一条短命 pf、
-    #    注册后即杀 —— 不依赖段外长寿命进程（沙箱/CI 里长 pf 易 lost connection）。
+    #    访问面：宿主 8443 由 kind extraPortMappings 常驻（docker-proxy 随集群存活），注册窗口无需自建转发。
     #    循环内条件一律显式 if：`[ ... ] && break` 空值时整行非零会被 set -e 秒杀。
     gw_probe() {
         curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 -o /dev/null --max-time 3 \
             "https://${SDP_GATEWAY_DOMAIN}:8443/api/v1/targets" 2>/dev/null
     }
     REG_PAYLOAD='{"name":"local-dev","vendor":"kind","region":"local"}'
-    REG_PF_PID=""
     REG_CODE=""
-    if ! gw_probe; then
-        log "宿主 8443 访问面不在 —— 注册窗口内自起短命 port-forward"
-        kubectl -n "$ENVOY_SVC_NS" port-forward "svc/$ENVOY_SVC" 8443:8443 >/dev/null 2>&1 &
-        REG_PF_PID=$!
-        for i in 1 2 3 4 5; do
-            if gw_probe; then break; fi
-            if [ "$i" = "5" ]; then REG_CODE="no-access"; fi
-            sleep 1
-        done
-    fi
+    for i in 1 2 3 4 5; do
+        if gw_probe; then break; fi
+        if [ "$i" = "5" ]; then REG_CODE="no-access"; fi
+        sleep 1
+    done
     if [ "$REG_CODE" != "no-access" ]; then
         if [ -n "${SKIP_AUTH:-}" ]; then
             REG_CODE=$(curl -s -k -o /tmp/sdp-register-target.json -w '%{http_code}' --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 \
@@ -809,19 +889,25 @@ stage_components() {
                 fi
             else
                 REG_CODE="no-token"
+                # admin 挂了 UPDATE_PASSWORD requiredAction（首登强制改密，设计内）时，
+                # password grant 恒 400 "Account is not fully set up"——区分提示，避免误判成
+                # keycloak/secret 故障去白排查。
+                if printf '%s' "$(cat "$KC_RESP_FILE" 2>/dev/null)" | grep -q 'Account is not fully set up'; then
+                    log "WARN: admin 未完成首登改密（UPDATE_PASSWORD 生效中，设计内）——bootstrap 无法用 admin password grant"
+                    log "       target 未注册；runner 握手前须先在 console 完成 admin 首登改密并建 target，或完成改密后重跑本段"
+                fi
             fi
         fi
     fi
     case "$REG_CODE" in
         200|201)   log "target registered: local-dev (HTTP $REG_CODE)" ;;
         409)       log "target local-dev already exists (HTTP 409) - ok" ;;
-        no-access) log "WARN: 宿主 8443 访问面不可用（短命 pf 也未就绪）—— 检查集群/envoy 状态后重跑本段" ;;
+        no-access) log "WARN: 宿主 8443 不可达（kind extraPortMappings 链路不通）—— 检查集群/envoy 状态后重跑本段" ;;
         no-token)  log "WARN: keycloak token 获取失败 (HTTP ${KC_CODE:-?})，响应见 ${KC_RESP_FILE}；检查 keycloak 是否 ready、sdp-backend secret 是否与 realm 预置一致" ;;
         000)       log "WARN: 注册请求连不通 (HTTP 000) —— 访问面在注册窗口内断连，重跑本段即可" ;;
         401|403)   log "WARN: target 注册被拒 (HTTP $REG_CODE) —— token 无效或 hub 侧拒绝" ;;
         *)         log "WARN: register target failed (HTTP $REG_CODE)" ;;
     esac
-    if [ -n "$REG_PF_PID" ]; then kill "$REG_PF_PID" 2>/dev/null || true; fi
 
     # 10. runner（image 从 harbor）
     "$HELM" upgrade --install runner "$RUNNER_DIR/build/runner/charts/software-distribution-platform-runner" \
@@ -863,7 +949,56 @@ stage_components() {
     log "=========================================="
 }
 
+# ---------- preflight（部署前静态自检：秒级拦住环境类失败；只查可静态判定项，不预测运行态） ----------
+preflight() {
+    # 1) docker daemon 探活：Mac 睡眠恢复后 VM 可能 soft lockup（症状会伪装成 pod/网络问题）。
+    #    macOS 无 timeout(1)，用系统自带 perl alarm 兜底；只提示+终止，不自动重启 Docker。
+    if ! perl -e 'alarm 8; exec @ARGV' docker ps -q >/dev/null 2>&1; then
+        log "FATAL: docker daemon 无响应（8s）—— Mac 睡眠后 VM 僵死的典型症状；请重启 Docker Desktop 后重跑"
+        exit 1
+    fi
+    # 2) kind 二进制：PATH 与 ~/.workbuddy 下可能各有一个（版本不同、schema 行为有差），打印实际用的那个。
+    command -v "$KIND" >/dev/null 2>&1 || { log "FATAL: 未找到 kind: $KIND"; exit 1; }
+    log "kind: $("$KIND" version 2>/dev/null | head -1) ($(command -v "$KIND"))"
+    # 3) 离线镜像缓存齐全性（关键路径子集）：缺了提示先跑 load-images.sh，不自动 load。
+    local img miss=""
+    for img in kindest/node:v1.27.3 registry:2 \
+        envoyproxy/gateway:v1.6.1 envoyproxy/envoy:distroless-v1.36.4 \
+        quay.io/keycloak/keycloak:26.7.4 postgres:16-alpine \
+        bitnamilegacy/harbor-core:2.13.2-debian-12-r3 bitnamilegacy/nginx:1.29.1-debian-12-r0; do
+        docker image inspect "$img" >/dev/null 2>&1 || miss="$miss $img"
+    done
+    if [ -n "$miss" ]; then
+        log "FATAL: 宿主 docker 缺少镜像:${miss}"
+        log "       先执行 ./load-images.sh 回灌离线缓存（images/），再重跑"
+        exit 1
+    fi
+    # 4) 宿主端口 8443/8082/443 须空闲或仅由 docker-proxy 持有（extraPortMappings 发布口）；
+    #    lsof 受权限限制看不到时 fail-open（持有者列空则放行）。
+    local port holder
+    for port in 8443 8082 443; do
+        # lsof 退出码 1 = 端口空闲（健康态）；set -o pipefail 下该管道非零会触发 set -e 误杀，须 || true 兜底。
+        # lsof 的 COMMAND 列截断到 9 字符：com.docker.backend 显示为 com.docke，排除须按前缀匹配。
+        holder=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 !~ /^com\.dock/ && $1 !~ /^docker/ {print $1; found=1}' | head -1) || true
+        if [ -n "$holder" ]; then
+            log "FATAL: 宿主端口 $port 已被 ${holder} 占用（须空闲或仅 docker-proxy 持有）；先停掉占用进程再重跑"
+            exit 1
+        fi
+    done
+    log "preflight OK"
+}
+
+# ---------- 阶段计时包装 ----------
+T0_TOTAL=$SECONDS
+run_stage() {
+    local s="$1" t0=$SECONDS
+    shift
+    "$@"
+    log "[stage $s] $((SECONDS - t0))s"
+}
+
 # ---------- 分发 ----------
+preflight
 if [ -n "$STAGE" ]; then
     # 单段模式：自动补齐幂等轻量前置（ensure_kind 导出 kubeconfig 供 kubectl 使用）
     ensure_helm
@@ -872,18 +1007,19 @@ if [ -n "$STAGE" ]; then
         infra|harbor) ensure_registry ;;   # 两段依赖 localhost:5000 bootstrap registry
     esac
     case "$STAGE" in
-        infra)      stage_infra ;;
-        harbor)     stage_harbor ;;
-        images)     stage_images ;;
-        platform)   stage_platform ;;
-        components) stage_components ;;
+        infra)      run_stage infra stage_infra ;;
+        harbor)     run_stage harbor stage_harbor ;;
+        images)     run_stage images stage_images ;;
+        platform)   run_stage platform stage_platform ;;
+        components) run_stage components stage_components ;;
     esac
     exit 0
 fi
 
 # 全量部署（人类默认路径；顺序 = 依赖顺序，与阶段化之前行为一致）
-stage_infra
-stage_harbor
-stage_images
-stage_platform
-stage_components
+run_stage infra stage_infra
+run_stage harbor stage_harbor
+run_stage images stage_images
+run_stage platform stage_platform
+run_stage components stage_components
+log "[stage all] 总耗时 $((SECONDS - T0_TOTAL))s"

@@ -3,7 +3,7 @@
 # 本文件【自包含、独立于 sdp 网关】：自带 GatewayClass(harbor-eg) + EnvoyProxy(harbor-eg)
 # + Gateway(harbor-gateway) + HTTPRoute，不引用 sdp 的网关基础设施（gateway-sdp.yaml / sdp-eg）。
 # 域名统一为 harbor.sdpworkflow.com（标准 443，仅经 Gateway 暴露，不出现在任何镜像引用里；
-# 见 local-kind-dev/deploy/kind.yaml —— 节点经网关 ClusterIP 在集群内直达，宿主经 port-forward）。
+# 见 local-kind-dev/deploy/kind.yaml —— 节点经网关 ClusterIP 在集群内直达，宿主经 extraPortMappings 443->NodePort 30443）。
 #
 # 前置：
 #   - EG controller 已装（envoy-gateway-helm-v1.6.1.tgz），且 harbor-eg 的 envoy 镜像走 localhost:5000 预推
@@ -23,9 +23,9 @@ spec:
     name: harbor-eg
     namespace: harbor
 ---
-# 独立的 EnvoyProxy（harbor 专用数据面，type: ClusterIP：与生产形态一致、零写死端口）。
-# 节点在集群内直接经此 ClusterIP 拉镜像（harbor.sdpworkflow.com -> 网关 ClusterIP，不经宿主进程）；
-# 宿主访问由 deploy-local.sh 起 sudo kubectl port-forward 443:443 暴露（仅用于 docker push / 浏览器）。
+# 独立的 EnvoyProxy（harbor 专用数据面，type: NodePort：宿主经 kind extraPortMappings 443->30443 直达）。
+# 节点在集群内直接经网关 ClusterIP 拉镜像（harbor.sdpworkflow.com -> 网关 ClusterIP，不经宿主进程）；
+# 固定 nodePort 由 deploy-local.sh 在 svc 创建后幂等 patch（CRD 无法声明固定值，实测不回改）。
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata:
@@ -40,7 +40,7 @@ spec:
           # 数据面镜像走 localhost:5000（bootstrap，节点拉不动 docker.io）；envoy 自身镜像不可依赖 harbor。
           image: localhost:5000/envoyproxy/envoy:distroless-v1.36.4
       envoyService:
-        type: ClusterIP
+        type: NodePort
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
