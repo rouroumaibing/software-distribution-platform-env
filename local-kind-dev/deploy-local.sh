@@ -232,7 +232,7 @@ ensure_node_dns_harbor() {
     [ -n "$dns" ] || { log "WARN: ensure_node_dns_harbor 未收到网关 svc 集群 DNS 名，跳过节点 DNS 更新"; return 1; }
     patch_coredns_rewrite "${HARBOR_REGISTRY}" "$dns"
     # ② 节点 /etc/resolv.conf 前置 CoreDNS（已前置则跳过，避免重复）
-    docker exec "$NODE" bash -c "grep -q '^nameserver 10.96.0.10' /etc/resolv.conf || sed -i '1i nameserver 10.96.0.10' /etc/resolv.conf" 2>/dev/null || true
+    docker exec "$NODE" sh -c "grep -q '^nameserver 10.96.0.10' /etc/resolv.conf || { printf 'nameserver 10.96.0.10\n' | cat - /etc/resolv.conf > /tmp/resolv.sdp && cat /tmp/resolv.sdp > /etc/resolv.conf; }" 2>/dev/null || true
     # ③ 节点 /etc/hosts 清除 harbor 行（grep -v 写临时文件再覆盖，规避 overlay rename 限制）
     docker exec "$NODE" sh -c "grep -v '${HARBOR_REGISTRY}' /etc/hosts > /tmp/hosts.sdp 2>/dev/null && cat /tmp/hosts.sdp > /etc/hosts" 2>/dev/null || true
     # ④ 重启 containerd 使 mirror + DNS 生效
@@ -263,8 +263,8 @@ harbor_status() { docker exec "$NODE" curl -s -k -o /dev/null -u "${HARBOR_USER}
 #（空凭据的 401 会在下游报成更难定位的推送失败）。
 ensure_harbor_pass() {
     if [ -z "$HARBOR_PASS" ]; then
-        HARBOR_PASS=$(kubectl -n harbor get secret -l app.kubernetes.io/component=core \
-            -o jsonpath='{.items[0].data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+        HARBOR_PASS=$(kubectl -n harbor get secret harbor-core-envvars \
+            -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
         if [ -z "$HARBOR_PASS" ]; then
             log "FATAL: 未能从 harbor core Secret 取回 admin 口令（口令由 chart 随机生成、不写死）——检查 harbor 安装状态，或显式传 HARBOR_PASS"
             exit 1
@@ -421,9 +421,9 @@ sdp_save() {
         esac
     fi; }
 sdp_inspect() { case "${SDP_RUNTIME}" in docker) docker image inspect "$1" ;; nerdctl) nerdctl image inspect "$1" ;; esac; }
-sdp_pull() { case "${SDP_RUNTIME}" in docker) docker pull "$1" ;; nerdctl) nerdctl pull "$1" ;; esac; }
+sdp_pull() { case "${SDP_RUNTIME}" in docker) docker pull "$@" ;; nerdctl) nerdctl pull "$@" ;; esac; }
 sdp_tag() { case "${SDP_RUNTIME}" in docker) docker tag "$1" "$2" ;; nerdctl) nerdctl tag "$1" "$2" ;; esac; }
-sdp_push() { case "${SDP_RUNTIME}" in docker) docker push "$1" ;; nerdctl) nerdctl push "$1" ;; esac; }
+sdp_push() { case "${SDP_RUNTIME}" in docker) docker push "$@" ;; nerdctl) nerdctl push "$@" ;; esac; }
 sdp_login() { case "${SDP_RUNTIME}" in docker) docker login "$@" ;; nerdctl) nerdctl login "$@" ;; esac; }
 
 resolve_runtime; echo "== container runtime: ${SDP_RUNTIME} =="
