@@ -1,0 +1,20 @@
+# 通用 Linux 基础服务安装配置
+# 目标环境：RedHat 系列（RHEL/CentOS/Rocky/Alma 等，systemd + yum），需以 root 执行
+# 用法：python3 install_services.py --config config.yaml [--dry-run]
+
+yum:
+  enable: true
+  iso_path: /tmp/linux_basic_services/centos7.iso   # 安装镜像路径（需存在）
+  repo_dir: /var/www/html/yum-repo
+
+nfs:
+  enable: true
+  data_path: /data/nfs   # 导出目录（允许任意主机挂载）
+
+ntp:
+  enable: true
+
+dns:
+  enable: true
+  domain: test.com        # 托管域名
+  map_ip: 203.0.113.20    # 该域名解析到的 IP
