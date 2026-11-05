@@ -608,19 +608,25 @@ stage_images() {
     BUILD_LOG_DIR="$ROOT/.logs"; mkdir -p "$BUILD_LOG_DIR"
     for comp in hub runner console; do
         mod_dir="$ROOT/software-distribution-platform-${comp}"
-        if sdp_inspect "software-distribution-platform-${comp}:${VERSION}" >/dev/null 2>&1; then
-            # 镜像已存在（前次构建产物仍在宿主 docker），跳过重建，仅由下方 node_push 循环重新推送；
-            # 若改了源码想强制重构建，先 docker rmi software-distribution-platform-${comp}:${VERSION} 或升版本号。
-            log "image software-distribution-platform-${comp}:${VERSION} present, skip rebuild (re-push via node below)"
-        else
-            log "building ${comp} (this may take a few minutes)"
-            blog="$BUILD_LOG_DIR/build-${comp}.log"
-            if ! ( cd "$mod_dir" && "$mod_dir/build/${comp}/build.sh" "$VERSION" ) >"$blog" 2>&1; then
-                log "FATAL: ${comp} 构建失败，日志尾部如下（完整: ${blog}）:"
-                tail -n 30 "$blog" | sed 's/^/    | /' >&2; exit 1
-            fi
-            log "${comp} built ok (log: $blog)"
+        local_img="software-distribution-platform-${comp}:${VERSION}"
+        # 重建前清理同版本号旧镜像：否则 build.sh 不会重新打包最新源码，推送/部署后节点
+        # （imagePullPolicy: Always）仍拉到旧 digest，改码不生效。
+        if sdp_inspect "$local_img" >/dev/null 2>&1; then
+            log "cleaning stale local image ${local_img} before rebuild"
+            case "${SDP_RUNTIME}" in
+                docker)  docker rmi "$local_img" >/dev/null 2>&1 \
+                    || log "WARN: 移除旧镜像 ${local_img} 失败（build 将覆盖该 tag，继续）" ;;
+                nerdctl) nerdctl rmi "$local_img" >/dev/null 2>&1 \
+                    || log "WARN: 移除旧镜像 ${local_img} 失败（build 将覆盖该 tag，继续）" ;;
+            esac
         fi
+        log "building ${comp} (this may take a few minutes)"
+        blog="$BUILD_LOG_DIR/build-${comp}.log"
+        if ! ( cd "$mod_dir" && "$mod_dir/build/${comp}/build.sh" "$VERSION" ) >"$blog" 2>&1; then
+            log "FATAL: ${comp} 构建失败，日志尾部如下（完整: ${blog}）:"
+            tail -n 30 "$blog" | sed 's/^/    | /' >&2; exit 1
+        fi
+        log "${comp} built ok (log: $blog)"
     done
     # 三组件镜像经节点推 harbor（build.sh 不推送；macOS Docker Desktop 下宿主 daemon 与节点网络隔离，
     # 直接 docker push 到 harbor.sdpworkflow.com:443 会失败，故统一走 node_push_to_harbor，
@@ -814,7 +820,7 @@ stage_components() {
         )
         log "auth ON: issuer=$ISSUER hostAlias=$ENVOY_IP"
     fi
-    HUB_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-hub:${VERSION}")
+    HUB_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-hub:${VERSION}" --set image.imagePullPolicy=Always)
     if [ ${#AUTH_SETS[@]} -gt 0 ]; then HUB_HELM_ARGS+=("${AUTH_SETS[@]}"); fi
     "$HELM" upgrade --install hub "$HUB_DIR/build/hub/charts/software-distribution-platform-hub" -n "$NS" "${HUB_HELM_ARGS[@]}"
     if [ -n "${SKIP_AUTH:-}" ]; then
@@ -909,9 +915,56 @@ stage_components() {
         *)         log "WARN: register target failed (HTTP $REG_CODE)" ;;
     esac
 
+    # 8.5 (§8c) 尽力而为：开放 sdp-backend 的 token-exchange 权限给 sdp-console，
+    # 使 Flow B 的 LoginClientImpersonate（RFC 8693 二次签发资源客户端令牌）可换到
+    # sdp-backend 令牌。失败仅 WARN 不阻断部署（handler 侧 impersonate 已是尽力而为回退）。
+    if [ -z "${SKIP_AUTH:-}" ]; then
+      KC_TE_RESP=/tmp/sdp-te.json
+      TE_TOKEN=""
+      for attempt in 1 2 3; do
+        TE_CODE=$(curl -s -k --resolve ${SDP_GATEWAY_DOMAIN}:8443:127.0.0.1 -o "$KC_TE_RESP" -w '%{http_code}' \
+          -X POST "https://${SDP_GATEWAY_DOMAIN}:8443/keycloak/realms/sdp/protocol/openid-connect/token" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -d 'grant_type=password&client_id=sdp-console&username=admin&password=sdp@12345' 2>/dev/null) || TE_CODE="000"
+        if [ "$TE_CODE" != "000" ]; then
+          TE_TOKEN=$(sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p' "$KC_TE_RESP" 2>/dev/null || true)
+        fi
+        [ -n "$TE_TOKEN" ] && break
+        [ "$attempt" != "3" ] && sleep 3
+      done
+      if [ -z "$TE_TOKEN" ]; then
+        log "WARN: §8c token-exchange 补丁跳过（admin token 获取失败；完成 admin 首登改密后重跑本段即可）"
+      else
+        KC_ADM="https://${SDP_GATEWAY_DOMAIN}:8443/keycloak/admin/realms/sdp"
+        BE=$(curl -s -k -H "Authorization: Bearer $TE_TOKEN" "$KC_ADM/clients?clientId=sdp-backend" 2>/dev/null | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+        CO=$(curl -s -k -H "Authorization: Bearer $TE_TOKEN" "$KC_ADM/clients?clientId=sdp-console" 2>/dev/null | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+        if [ -n "$BE" ] && [ -n "$CO" ]; then
+          curl -s -k -o /dev/null -X PUT "$KC_ADM/clients/$BE/management/permissions" -H "Authorization: Bearer $TE_TOKEN" -H "Content-Type: application/json" -d '{"enabled":true}' 2>/dev/null || true
+          SCOPE_PERM=$(curl -s -k -H "Authorization: Bearer $TE_TOKEN" "$KC_ADM/clients/$BE/management/permissions" 2>/dev/null | sed -n 's/.*"token-exchange":"\([^"]*\)".*/\1/p' | head -1)
+          if [ -n "$SCOPE_PERM" ]; then
+            POLICY_ID=$(curl -s -k -X POST "$KC_ADM/clients/$BE/authz/resource-server/policy/client-scope" -H "Authorization: Bearer $TE_TOKEN" -H "Content-Type: application/json" -d "{\"name\":\"sdp-console-token-exchange\",\"clients\":[\"$CO\"]}" 2>/dev/null | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+            if [ -n "$POLICY_ID" ]; then
+              curl -s -k -o /dev/null -X PUT "$KC_ADM/clients/$BE/authz/resource-server/scope/$SCOPE_PERM" -H "Authorization: Bearer $TE_TOKEN" -H "Content-Type: application/json" -d "{\"id\":\"$SCOPE_PERM\",\"policies\":[{\"id\":\"$POLICY_ID\"}]}" 2>/dev/null || true
+              log "§8c token-exchange 权限已开放（sdp-console -> sdp-backend）"
+            else
+              log "WARN: §8c token-exchange 补丁部分完成（client policy 创建失败，可重跑本段）"
+            fi
+          else
+            log "WARN: §8c token-exchange 补丁跳过（token-exchange scope permission 未就绪，可重跑本段）"
+          fi
+        else
+          log "WARN: §8c token-exchange 补丁跳过（无法解析 sdp-backend/sdp-console client id）"
+        fi
+      fi
+    fi
+
     # 10. runner（image 从 harbor）
     "$HELM" upgrade --install runner "$RUNNER_DIR/build/runner/charts/software-distribution-platform-runner" \
-        -n "$NS" --set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-runner:${VERSION}"
+        -n "$NS" --set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-runner:${VERSION}" --set image.imagePullPolicy=Always
+    # 同版本号重建后强制重启触发 re-pull：脚本注入 imagePullPolicy=Always 强拉同 tag 新 digest
+    # （chart 默认 IfNotPresent 生产友好；此处覆盖为 Always 仅服务本地同号迭代，image 字符串未变时 helm
+    # upgrade 不触发滚动更新，否则旧镜像继续运行）。
+    kubectl -n "$NS" rollout restart deploy/runner
     kubectl -n "$NS" rollout status deploy/runner --timeout=180s
     log "runner ready"
 
@@ -925,13 +978,19 @@ stage_components() {
             --set auth.keycloakRedirectUri="https://${SDP_GATEWAY_DOMAIN}:8443/auth/callback"
         )
     fi
-    CONSOLE_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-console:${VERSION}")
+    CONSOLE_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-console:${VERSION}" --set image.imagePullPolicy=Always)
     if [ ${#AUTH_SETS_CONSOLE[@]} -gt 0 ]; then CONSOLE_HELM_ARGS+=("${AUTH_SETS_CONSOLE[@]}"); fi
     "$HELM" upgrade --install console "$CONSOLE_DIR/build/console/charts/software-distribution-platform-console" \
         -n "$NS" "${CONSOLE_HELM_ARGS[@]}"
     kubectl -n "$NS" rollout restart deploy/console
     kubectl -n "$NS" rollout status deploy/console --timeout=180s
     log "console ready"
+
+    # hub 同版本号重建后也需重启触发 re-pull：本地覆盖 imagePullPolicy=Always 强拉同 tag 新 digest
+    # （chart 默认 IfNotPresent；helm upgrade 因 image 字符串未变不触发滚动更新）。
+    kubectl -n "$NS" rollout restart deploy/hub
+    kubectl -n "$NS" rollout status deploy/hub --timeout=240s
+    log "hub re-pulled (local override: imagePullPolicy=Always)"
 
     # 12. 网关握手验证
     OK=""
