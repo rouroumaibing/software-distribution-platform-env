@@ -326,7 +326,8 @@ node_push_to_harbor() {
     # 仅当 kind-registry 不可用时兜底退回 docker save|ctr import（单平台镜像可用，多架构可能缺 blob）。
     if docker inspect kind-registry >/dev/null 2>&1; then
         local dst="localhost:5000/${name}:${tag}"
-        sdp_inspect "$dst" >/dev/null 2>&1 || sdp_tag "$src" "$dst"
+        # 中间 tag 每次覆盖：同版本重建时 src 是新构建镜像，残留的旧 tag 会把旧 digest 推上 harbor。
+        sdp_tag "$src" "$dst"
         if sdp_push -q "$dst" >/dev/null 2>&1; then
             local rgip
             rgip=$(docker inspect kind-registry --format \
@@ -820,7 +821,7 @@ stage_components() {
         )
         log "auth ON: issuer=$ISSUER hostAlias=$ENVOY_IP"
     fi
-    HUB_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-hub:${VERSION}" --set image.imagePullPolicy=Always)
+    HUB_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-hub:${VERSION}" --set image.pullPolicy=Always)
     if [ ${#AUTH_SETS[@]} -gt 0 ]; then HUB_HELM_ARGS+=("${AUTH_SETS[@]}"); fi
     "$HELM" upgrade --install hub "$HUB_DIR/build/hub/charts/software-distribution-platform-hub" -n "$NS" "${HUB_HELM_ARGS[@]}"
     if [ -n "${SKIP_AUTH:-}" ]; then
@@ -960,7 +961,7 @@ stage_components() {
 
     # 10. runner（image 从 harbor）
     "$HELM" upgrade --install runner "$RUNNER_DIR/build/runner/charts/software-distribution-platform-runner" \
-        -n "$NS" --set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-runner:${VERSION}" --set image.imagePullPolicy=Always
+        -n "$NS" --set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-runner:${VERSION}" --set image.pullPolicy=Always
     # 同版本号重建后强制重启触发 re-pull：脚本注入 imagePullPolicy=Always 强拉同 tag 新 digest
     # （chart 默认 IfNotPresent 生产友好；此处覆盖为 Always 仅服务本地同号迭代，image 字符串未变时 helm
     # upgrade 不触发滚动更新，否则旧镜像继续运行）。
@@ -978,7 +979,7 @@ stage_components() {
             --set auth.keycloakRedirectUri="https://${SDP_GATEWAY_DOMAIN}:8443/auth/callback"
         )
     fi
-    CONSOLE_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-console:${VERSION}" --set image.imagePullPolicy=Always)
+    CONSOLE_HELM_ARGS=(--set image.imageAddr="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/software-distribution-platform-console:${VERSION}" --set image.pullPolicy=Always)
     if [ ${#AUTH_SETS_CONSOLE[@]} -gt 0 ]; then CONSOLE_HELM_ARGS+=("${AUTH_SETS_CONSOLE[@]}"); fi
     "$HELM" upgrade --install console "$CONSOLE_DIR/build/console/charts/software-distribution-platform-console" \
         -n "$NS" "${CONSOLE_HELM_ARGS[@]}"
