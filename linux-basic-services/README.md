@@ -20,7 +20,7 @@ sudo python3 install_services.py --config config.yaml --service nfs  # 只处理
 | `yum` | `iso_path`、`repo_dir` | 先把 `/etc/yum.repos.d/*.repo` **移入** `/etc/yum.repos.d.bk`（目录不存在则创建，仅移动不恢复）以离线安装；再将 `iso_path` **拷贝**到 `/mnt/iso`（保留原文件，目录不存在则创建）后 loop 挂载、临时固化到 `/etc/fstab`；装 `httpd`/`createrepo`（仓库服务端依赖）并把 ISO 内 RPM 拷到 `repo_dir` 由 httpd 经 `Alias /repo/` 对外提供仓库（即 `http://<本机IP>/repo/`）；**校验**对外源成功后直接覆盖写 `Base.repo` 指向本机网络源（`http://<本机IP>/repo/`）、清理本地源 + fstab；原网络源 .repo 备份在 `/etc/yum.repos.d.bk` 不恢复 |
 | `nfs` | `data_path` | 装 `nfs-utils` + `rpcbind`（`yum -y install nfs-utils rpcbind`），将 `data_path` 导出（任意主机可挂载），启 `rpcbind` + `nfs`（enable rpcbind → enable nfs → restart rpcbind → restart nfs） |
 | `ntp` | — | 装 `ntp`，以本机本地时钟 `127.127.1.0` 授时，开放给所有可达节点（不接外部上游）；启动后用 `ntpdate -q <本机 IP>` 自检服务端可应答（仅查询不校时，失败仅告警） |
-| `dns` | `domain`、`map_ip` | 装 `dnsmasq`，把 `domain` 解析到 `map_ip` 作 DNS 服务端对外/对内解析（**不修改本机 /etc/resolv.conf**，各机器自行把 DNS 指向本机 IP） |
+| `dns` | `domain`、`map_ip` | 装 `dnsmasq`，把 `domain` 解析到 `map_ip` 作 DNS 服务端对外/对内解析（**不修改本机 /etc/resolv.conf**，各机器自行把 DNS 指向本机 IP）；绑定具体地址时用 `bind-dynamic`（地址未就绪不退出、出现后补建监听），并写 systemd drop-in（`Wants/After=network-online.target` + `Restart=on-failure`）保证 DHCP 机器重启后可用；启动后自检 `<bind_ip>:53` 监听与 `domain` 应答（失败先告警再中断，fail-fast） |
 
 各服务只写入带 `# managed by linux-basic-services` 标记的配置片段；`cleanup` 仅移除这些托管片段/文件、不碰其它配置，且只停服 + 禁用自启，不卸载软件包。
 

@@ -414,6 +414,57 @@ def _verify_ntp_server(target, ctx):
     return True
 
 
+def _verify_dns_server(bind_ip, domain, ctx, fail_fast=False):
+    """dnsmasq 启动后自检：确认预期地址已监听 53 且能应答 domain。
+
+    只读探测（ss -lun + 可选 dig），失败先 ctx.warn 暴露细节，
+    fail_fast=True 时再抛 RuntimeError 中断部署（与 HTTP 源自检的错误处理对齐）。
+    目的是把「绑错 IP / 未监听」提前暴露在安装日志，而不再推迟到集群侧才被发现。
+    bind_ip=None 表示全接口监听，探测目标退化为 127.0.0.1。
+    dry-run 下不执行命令，仅打印意图并返回 True。
+    """
+    probe_ip = bind_ip or "127.0.0.1"
+    if ctx.dry_run:
+        ctx.info(f"would verify dns listener: ss -lun 查 {probe_ip}:53，"
+                 f"dig @{probe_ip} {domain}")
+        return True
+
+    ok = True
+    # 1) 端口监听：ss -lun 本地地址:端口列按 bind_ip 精确匹配；
+    #    通配 0.0.0.0:53 / *:53 视为覆盖，绑到别的 IP 则判失败（错 IP 早暴露）。
+    rc, out = ctx.run("ss -lun", check=False)
+    if rc != 0:
+        ctx.warn(f"dns 自检未通过：ss -lun 执行失败 rc={rc}，无法确认 {probe_ip}:53 监听")
+        ok = False
+    else:
+        tokens = [tok for line in (out or "").splitlines() for tok in line.split()]
+        if bind_ip:
+            hit = any(t == f"{bind_ip}:53" or t in ("0.0.0.0:53", "*:53") for t in tokens)
+        else:
+            hit = any(t.endswith(":53") for t in tokens)
+        if not hit:
+            ctx.warn(f"dns 自检未通过：ss -lun 未见 {probe_ip}:53 监听；"
+                     f"请确认 bind_ip 与网卡地址一致、dnsmasq 已就绪")
+            ok = False
+    # 2) 应答验证：dig 可用时再确认 domain 端到端可解析（缺 dig 则跳过此步）。
+    rc_dig, _ = ctx.run("command -v dig >/dev/null 2>&1", check=False)
+    if rc_dig == 0:
+        _, ans = ctx.run(f"dig +short @{probe_ip} {domain}", check=False)
+        if not (ans or "").strip():
+            ctx.warn(f"dns 自检未通过：dig @{probe_ip} {domain} 无应答；"
+                     f"请确认 domain/map_ip 及上游转发配置")
+            ok = False
+    if ok:
+        ctx.info(f"dns 自检通过：{probe_ip}:53 已监听且 {domain} 可应答")
+        return True
+    if fail_fast:
+        raise RuntimeError(
+            f"dns 启动后自检失败：{probe_ip}:53 未在预期地址监听或 {domain} 无可解析应答；"
+            f"请按上方 WARN 复核 bind_ip、dnsmasq 状态与上游转发配置"
+        )
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 四个服务：每个一个函数，内部按 清理 -> 安装（安装前先调 check_* 安全前检查）
 # ---------------------------------------------------------------------------
@@ -556,8 +607,14 @@ def deploy_yum(cfg, ctx):
         ctx.info(f"would remove fstab lines marked '{MARK}'")
     else:
         _strip_lines(fstab, MARK)
-    # 刷新本机 yum 元数据，使其回到网络源（Base.repo 指向本机 /repo/）
-    ctx.run("yum makecache 2>/dev/null || true", check=False)
+    # 刷新本机 yum 元数据，使其回到网络源（Base.repo 指向本机 /repo/）。
+    # 失败不再用 2>/dev/null || true 静默吞噬：与 HTTP 源自检的错误处理对齐，
+    # 失败至少告警暴露。此步为收尾刷新（Base.repo 已写好，下次 yum 会自动重建缓存），
+    # 故告警而非 fail-fast；若网络源确实不可用，前面的 HTTP 自检已 fail-fast 中断。
+    rc, out = ctx.run("yum makecache 2>&1", check=False)
+    if rc != 0:
+        ctx.warn(f"yum makecache 刷新元数据失败 rc={rc}：{(out or '').strip()[-400:]}；"
+                 f"Base.repo 已指向本机网络源，请人工复核其可用性")
 
     addr = _advertise_host(advertise)
     client_repo = (
@@ -682,14 +739,18 @@ def deploy_dns(cfg, ctx):
     conf = "/etc/dnsmasq.conf"
     resolv = "/etc/resolv.conf"                          # 仅读取上游，绝不改写
     old_conf = "/etc/dnsmasq.d/linux_basic_services.conf"  # 旧 drop-in，切换后清理避免重复
+    # systemd drop-in：让 dnsmasq 在网络就绪后启动，且失败可自动重启。
+    dropin_dir = "/etc/systemd/system/dnsmasq.service.d"
+    dropin = f"{dropin_dir}/linux-basic-services.conf"
 
     # 清理：删除旧 drop-in（避免与新托管块重复加载），并从 dnsmasq.conf 移除托管块。
     # 注意 conf 是 /etc/dnsmasq.conf（主配置），绝不能整文件删除，只能按标记剔除。
     # _strip_lines 兼容清理旧版本写入的零散 MARK 行（旧版把 MARK 放行首，实为注释）。
-    # 本服务不触碰 /etc/resolv.conf。
+    # 本服务不触碰 /etc/resolv.conf；systemd drop-in 由安装段重写并在其后 daemon-reload。
     ctx.run("systemctl stop dnsmasq 2>/dev/null || true", check=False)
     ctx.run("systemctl disable dnsmasq 2>/dev/null || true", check=False)
     ctx.run(f"rm -f {old_conf}", check=False)
+    ctx.run(f"rm -f {dropin}", check=False)
     if ctx.dry_run:
         ctx.info(f"would remove managed block from {conf}")
     else:
@@ -714,13 +775,15 @@ def deploy_dns(cfg, ctx):
     for ip in fwd:
         lines.append(f"server={ip}")
     # 监听地址：显式 listen_ip > 自动探测本机 IP > 0.0.0.0 兜底。
-    # - 显式具体地址：bind-interfaces + 监听该地址与回环 127.0.0.1。
+    # - 显式具体地址：bind-dynamic + 监听该地址与回环 127.0.0.1。
+    #   bind-dynamic 与 bind-interfaces 的区别：网卡地址尚未就绪时不退出，
+    #   待 DHCP 分配到地址后自动补建监听（修复 DHCP 机器重启后 dnsmasq 必挂）。
     #   回环仍监听：方便本机在自行把 resolv.conf 指向 127.0.0.1 时使用本服务（本脚本不自动改）。
     # - 缺省（未配置）：自动探测本机 IP（NODE_IP/POD_IP → 默认路由出口 → hostname -i）；
     #   探测失败 / 显式 0.0.0.0：不写 listen-address，监听所有接口（其它机器经主机 IP 可访问）。
     bind_ip = _resolve_bind(listen_ip)
     if bind_ip and bind_ip != "0.0.0.0":
-        lines.append("bind-interfaces")
+        lines.append("bind-dynamic")
         lines.append(f"listen-address={bind_ip}")
         lines.append("listen-address=127.0.0.1")
     lines.append(MARK_CLOSE)
@@ -732,7 +795,27 @@ def deploy_dns(cfg, ctx):
         os.makedirs(os.path.dirname(conf), exist_ok=True)
         with open(conf, "a", encoding="utf-8") as fh:
             fh.write(content)
+    # systemd drop-in：network-online 之后再启动（DHCP 地址已就绪），失败自动重启兜底。
+    # Wants/After 为追加语义，不覆盖单元原有的依赖；RestartSec 避免失败时忙循环。
+    dropin_content = (f"{MARK}\n"
+                      "[Unit]\n"
+                      "Wants=network-online.target\n"
+                      "After=network-online.target\n"
+                      "\n"
+                      "[Service]\n"
+                      "Restart=on-failure\n"
+                      "RestartSec=5\n")
+    if ctx.dry_run:
+        ctx.info(f"would write {dropin}:\n{dropin_content}")
+    else:
+        os.makedirs(dropin_dir, exist_ok=True)
+        with open(dropin, "w", encoding="utf-8") as fh:
+            fh.write(dropin_content)
+    ctx.run("systemctl daemon-reload")
     ctx.run("systemctl enable --now dnsmasq")
+    # 启动后自检：确认 bind_ip:53 已在监听且 domain 可应答；
+    # 失败先告警再中断（fail_fast），与 HTTP 源自检的错误处理对齐。
+    _verify_dns_server(bind_ip, domain, ctx, fail_fast=True)
 
 
 def disable_firewall(ctx):
