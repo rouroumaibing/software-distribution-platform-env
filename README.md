@@ -5,6 +5,38 @@
 > 本目录（`software-distribution-platform-env`）收口"平台周边部署脚手架与本地联调基础设施"，
 > **不随 hub/runner/console 三仓打包**；各组件 chart 只按名字引用这里的 Gateway 等网关级资源。
 
+## 0. local kind vs cloud 一页对照
+
+本仓有两套部署拓扑，先按下表选一套再读对应 README。差异项的判定方法与逐项落定结果见 docs 仓 `plans/FIDELITY-KIND-VS-CLOUD-2026-10-09.md`；验收状态见 docs 仓 `plans/STATUS.md`。
+
+| 维度 | local kind（`local-kind-dev/`） | cloud（`prod-deplyment/`，CCE 托管 K8s） |
+| --- | --- | --- |
+| 定位 | 开发迭代、日常 E2E、helm 渲染与镜像构建验证 | 里程碑 / 发布前验收 gate；多节点、真 DNS、真证书、真 LB、canary 真流量 |
+| 镜像仓库 | 集群内自建 harbor（`harbor.sdpworkflow.com`，443 无端口）；节点 containerd mirror + CoreDNS rewrite 集群内直达 harbor 网关 ClusterIP；`localhost:5000` 仅作 bootstrap 中转 | 默认集群内自建 harbor（ELB 443 暴露）；也可走 `deploy-without-harbor.sh` 直推外部 OCI registry（如 SWR），此时不需要 harbor 网关与 harbor 内网 DNS |
+| 平台入口网关 | 社区版 Envoy Gateway（helm chart `envoy-gateway-helm-v1.6.1.tgz`），数据面 svc 为 NodePort + kind `extraPortMappings`；平台入口 `https://www.sdpworkflow.com:8443`，harbor 走 443 | CCE 官方「Envoy Gateway」插件（GatewayClass `envoy-gateway`），按 Gateway listener 自动创建独享 ELB，平台 https listener = **443**；自建 EG 数据面为 ClusterIP、云上无 LB，禁用 |
+| EG 插件来源 | `helm pull envoyproxy/gateway-helm --version 1.6.1`（社区 chart，二进制不入库，部署前拉取） | 云控制台安装的 CCE 官方插件，不装社区 chart；yaml 见 `gateway-sdp-cce.yaml` / `gateway-harbor-cce.yaml` |
+| DNS / CoreDNS | 节点 `/etc/resolv.conf` 前置 CoreDNS（10.96.0.10），`rewrite name harbor.sdpworkflow.com` → harbor 网关 ClusterIP；不依赖宿主进程 | 真内网 DNS：`harbor.sdpworkflow.com` / `www.sdpworkflow.com` 分别指向两个 ELB IP；无 rewrite |
+| 证书入口 | `cert-build/cert-create.sh` 自签 CA（`*.sdpworkflow.com`）+ 手动信任（节点 `insecure-registries` 或安装 ca.crt 为系统信任根）；`harbor-tls` / `console-ingress-tls` 等 secret；不装 cert-manager | 自签 CA 经 privileged DaemonSet `harbor-ca-trust` 分发全节点并重启 containerd，网关 TLS 终结处配 4 个 TLS secret；正规 CA 消除分发为后续项；不装 cert-manager |
+| 重建成本 | 改了 `deploy/kind.yaml`（mirror / 端口映射）必须重建集群，镜像离线缓存在 `images/` | 部署脚本幂等；清理默认可逆（保留 ns/PVC），删数据须显式 `--delete-namespace` / `--delete-pvc` |
+
+### 何时选哪条（决策树）
+
+```
+你要做什么？
+├─ 改代码 / 跑日常 E2E / 看 helm 渲染 / 构建镜像
+│   └─ 选 local kind：读 local-kind-dev/README.md
+│       └─ 离线环境先 load-images.sh；改过 kind.yaml 必须重建集群
+├─ 发布前验收 / canary 真流量 / 多节点调度与 PV / 真 DNS / 真证书链 / ELB 行为
+│   └─ 选 cloud：读 prod-deplyment/README.md
+│       ├─ 用集群内 harbor → hce-2.0-64bit-deploy.sh（镜像先入 harbor）
+│       └─ 用外部 OCI registry（SWR 等）→ deploy-without-harbor.sh
+│           （不需要 harbor 网关、harbor-tls、harbor 内网 DNS 与节点 CA 分发）
+└─ 只想搞清两套拓扑差在哪
+    └─ 读 docs/plans/FIDELITY-KIND-VS-CLOUD-2026-10-09.md
+```
+
+> 云上验收脚本（`e2e-smoke.sh` / `e2e-cancel-rerun.sh` / `e2e-canary.sh`）真源在本仓 `prod-deplyment/`，云上节点直跑；结果状态见 docs 仓 `plans/STATUS.md`。
+
 本地开发（一键部署 / 清理脚本）
 - `local-kind-dev/`：从工作区根迁来的 5 个本地联调脚本
   - `deploy-local.sh`      本地一键部署三组件（+ postgres / keycloak / gateway）

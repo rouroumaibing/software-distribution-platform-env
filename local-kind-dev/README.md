@@ -118,12 +118,4 @@ cd software-distribution-platform-env/local-kind-dev
 
 ## 六、镜像构建工具链要求（containerd 路线）
 
-三组件镜像由各仓 `build/<comp>/build.sh` 构建。无 docker 的环境（如 CCE 托管节点）走 nerdctl + buildkitd 复用宿主 containerd，对工具链版本有**硬要求**：
-
-| 工具 | 版本要求 | 原因 |
-| --- | --- | --- |
-| nerdctl | **>= 2.x** | `nerdctl save` 默认输出 docker 归档格式，无 `--format` 旗标；`build.sh` 的 `sdp_save` 按此直写 |
-| buildkitd | **>= v0.34** | `--containerd-worker` 为 string 型（true/false/auto），`build.sh` 用 `--containerd-worker=true` 显式赋值拉起；裸旗标会把后面的 `--addr` 当值吃掉导致 `strconv.ParseBool` 崩溃 |
-| containerd | 复用宿主托管实例 | **不要安装 docker / containerd.io**（会与宿主 containerd.service 冲突，CCE 节点尤其如此） |
-
-buildkitd 读取默认配置 `/etc/buildkit/buildkitd.toml`，docker.io 直连不通的环境需在此配置 registry mirrors（写法参见同仓 `prod-deplyment/hce-2.0-64bit-env.sh`，该脚本幂等，可直接在目标节点执行补齐）。版本要求的统一权威见 docs 仓 `shared/BUILD-TOOLCHAIN.md`。
+三组件镜像由各仓 `build/<comp>/build.sh` 构建；nerdctl / buildkitd 的版本要求、mirrors 配置与构建脚本行为要点统一见 docs 仓 `shared/BUILD-TOOLCHAIN.md`。docker.io 直连不通的节点可按 `prod-deplyment/hce-2.0-64bit-env.sh` 补齐 `/etc/buildkit/buildkitd.toml`。

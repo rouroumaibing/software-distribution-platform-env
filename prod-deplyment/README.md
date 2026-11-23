@@ -21,6 +21,31 @@
 | `e2e-smoke.sh` | 全页面 API 契约冒烟（PASS=15） |
 | `e2e-cancel-rerun.sh` | 取消/重跑定向验证（PASS=11） |
 | `e2e-canary.sh` | canary 真流量验收：release 流水线 → Rollout 步进 → 50% 暂停窗口合成流量采样 → 权重快照回流 → 100% 收口 |
+| `e2e-example-release.sh` | example 软件经 SDP API 单 stable 镜像直发验收 |
+
+#### 云上验收 gate：`gate-cloud.sh`
+
+把四个脚本串成一条可复现的验收 gate：按 `smoke → cancel-rerun → canary → example` 串行（前者是后者的前置，不可换序），每步 stdout/stderr `tee` 到 `gate-evidence/<UTC>/<script>.log`。判定**只认结尾 `RESULT: PASS=n FAIL=m` 行，不能只看退出码**（smoke / cancel-rerun 恒返回 0）：FAIL>0、无 RESULT 行或脚本非 0 退出即停，汇总写入同目录 `summary.txt`（步骤 / BASE / RESULT / 退出码 / 镜像 tag / 时间）。脚本只编排，不重写断言、不部署、不清理。
+
+前置条件：
+
+- 平台已部署、Runner online（`GET /targets` 有 online 项），且执行节点能访问 `BASE`（预检探活 `${BASE}/targets`）。
+- `TOKEN` 可由环境变量注入；留空时依赖 Keycloak password grant（`KC_ISSUER/KC_CLIENT/KC_USER/KC_PASS` 可覆盖），预检会先换取一次确认获取能力。
+- 仅 `canary` / `example` 需要 `kubectl` 与可读的 `KUBECONFIG`（默认 `/root/.kube/config`），以及 SWR 上的 stable / canary 镜像；预检按需检查，单项演练可跳过。
+
+用法与覆盖项：
+
+```bash
+./gate-cloud.sh                          # 全量四步
+./gate-cloud.sh --only=smoke             # 单项演练
+./gate-cloud.sh --only=canary,example    # 指定多步
+BASE=https://www.sdpworkflow.com/api/v1 \
+STABLE_IMG=swr.cn-north-4.myhuaweicloud.com/sdp-20261022/nginx-canary:v0.0.1 \
+CANARY_IMG=swr.cn-north-4.myhuaweicloud.com/sdp-20261022/nginx-canary:v0.0.2 \
+./gate-cloud.sh --only=canary
+```
+
+可覆盖环境变量：`BASE`、`TOKEN`、`KUBECONFIG`、`STABLE_IMG`、`CANARY_IMG`（另含 `KC_ISSUER/KC_CLIENT/KC_USER/KC_PASS`、`CURL`）。
 
 ### 环境清理脚本（云上节点直跑，与部署/验收同源）
 
@@ -54,15 +79,7 @@
 
 ## 镜像构建工具链要求（containerd 路线）
 
-三组件镜像由各仓 `build/<comp>/build.sh` 构建。无 docker 的环境走 nerdctl + buildkitd 复用宿主 containerd，对工具链版本有**硬要求**：
-
-| 工具 | 版本要求 | 原因 |
-| --- | --- | --- |
-| nerdctl | **>= 2.x** | `nerdctl save` 默认输出 docker 归档格式，无 `--format` 旗标；`build.sh` 的 `sdp_save` 按此直写 |
-| buildkitd | **>= v0.34** | `--containerd-worker` 为 string 型（true/false/auto），`build.sh` 用 `--containerd-worker=true` 显式赋值拉起；裸旗标会把后面的 `--addr` 当值吃掉导致 `strconv.ParseBool` 崩溃 |
-| containerd | 复用宿主托管实例 | 禁止安装 docker / containerd.io（会与宿主 containerd.service 冲突） |
-
-版本要求的统一权威见 docs 仓 [`shared/BUILD-TOOLCHAIN.md`](https://github.com/rouroumaibing/software-distribution-platform-docs/blob/main/shared/BUILD-TOOLCHAIN.md)。
+三组件镜像由各仓 `build/<comp>/build.sh` 构建；nerdctl / buildkitd 的版本要求与构建脚本行为要点统一见 docs 仓 [`shared/BUILD-TOOLCHAIN.md`](https://github.com/rouroumaibing/software-distribution-platform-docs/blob/main/shared/BUILD-TOOLCHAIN.md)。
 
 ## buildkitd registry mirrors
 
