@@ -23,35 +23,34 @@ WORKLOAD="${WORKLOAD:-nginx-canary}"
 STABLE_IMG="${STABLE_IMG:-harbor.sdpworkflow.com/sdp/nginx-canary:v0.0.1}"
 CANARY_IMG="${CANARY_IMG:-harbor.sdpworkflow.com/sdp/nginx-canary:v0.0.2}"
 REPLICAS="${REPLICAS:-4}"
+SAMPLE_IMAGE="${SAMPLE_IMAGE:-curlimages/curl:8.8.0}"  # 流量采样 pod 镜像；离线环境覆盖为私有 registry 地址
 export KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
 
-# ---------- 认证（与 e2e-smoke.sh 同款：脚本内动态换取 token） ----------
-export no_proxy="${no_proxy:-*}" NO_PROXY="${NO_PROXY:-*}"
-KC_ISSUER="${KC_ISSUER:-https://www.sdpworkflow.com/keycloak/realms/sdp}"
-KC_CLIENT="${KC_CLIENT:-sdp-console}"; KC_USER="${KC_USER:-admin}"; KC_PASS="${KC_PASS:-sdp@12345}"
-if [ -z "${TOKEN:-}" ]; then
-  TOKEN=$(curl -sk -s "$KC_ISSUER/protocol/openid-connect/token" \
-    -d grant_type=password -d client_id="$KC_CLIENT" \
-    -d username="$KC_USER" -d password="$KC_PASS" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)
-  [ -n "$TOKEN" ] || { echo "错误: token 获取失败" >&2; exit 1; }
-fi
-AUTH=(); [ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
-PASS=0; FAIL=0
-ok()  { PASS=$((PASS+1)); echo "PASS $*"; }
-bad() { FAIL=$((FAIL+1)); echo "FAIL $*"; }
-req() { # method path body -> body；2xx 打 PASS 到 stderr 的职责移交给调用方断言
-  local m="$1" p="$2" b="${3:-}" out code
-  if [ -n "$b" ]; then
-    out=$($CURL -w "\n%{http_code}" -X "$m" "$BASE$p" -H 'Content-Type: application/json' ${AUTH[@]+"${AUTH[@]}"} -d "$b")
-  else
-    out=$($CURL -w "\n%{http_code}" -X "$m" "$BASE$p" ${AUTH[@]+"${AUTH[@]}"})
+# ---------- 0. 环境复位：清理上一轮 gate 遗留的 rollout 与部署状态 ----------
+# Rollout CR 在 run 结束后不自动清理，其 controller 持续 reconcile。上一轮 gate 的
+# rollout 若与新 rollout 同管一个 workload，会互踩副本数：stable 刚扩容即被旧
+# controller 压回 0（永远到不了 ready），采样窗口 endpoints 抖空 → v0.0.1/v0.0.2 双 0。
+# 每轮先删遗留 rollout，并把部署复位到 stable(v0.0.1) 基线态。
+for PAIR in $(kubectl -n "$ROLLOUT_NS" get rollouts -o jsonpath='{range .items[*]}{.metadata.name}:{.spec.workloadRef} {end}' 2>/dev/null); do
+  RONAME="${PAIR%%:*}"; ROWL="${PAIR##*:}"
+  if [ "$ROWL" = "$WORKLOAD" ]; then
+    kubectl -n "$ROLLOUT_NS" delete rollout "$RONAME" --ignore-not-found >/dev/null 2>&1
+    echo "  [复位] 清理遗留 rollout ${RONAME}（workload=${WORKLOAD}）"
   fi
-  code="${out##*$'\n'}"; echo "${out%$'\n'*}"
-  [[ "$code" =~ ^2 ]] || echo "  [http $code] $m $p" >&2
-}
-jqf() { python3 -c "import sys,json;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1" 2>/dev/null; }
-jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1" 2>/dev/null; }
+done
+if kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD" >/dev/null 2>&1; then
+  kubectl -n "$ROLLOUT_NS" scale deploy "$WORKLOAD" --replicas="$REPLICAS" >/dev/null 2>&1
+  kubectl -n "$ROLLOUT_NS" scale deploy "$WORKLOAD-canary" --replicas=0 >/dev/null 2>&1
+  for i in $(seq 1 18); do
+    R=$(kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+    [ "${R:-0}" -ge 2 ] 2>/dev/null && break
+    sleep 5
+  done
+  echo "  [复位] stable 基线副本就绪=${R:-0}/$REPLICAS"
+fi
+
+# ---------- 认证与断言骨架（单一真源 e2e-common.sh） ----------
+. "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 
 TS=$(date +%s)
 # ---------- 1. 资源准备 ----------
@@ -81,6 +80,18 @@ for i in $(seq 1 10); do
 done
 [ -n "$CRNAME" ] || { bad "crName 获取"; exit 1; }
 
+# ---------- 3.5 预热采样 pod ----------
+# 50% 暂停窗口仅 30s；窗口内现拉 curl pod（调度+启动+40 次采样）会错过窗口，
+# 导致 v0.0.1/v0.0.2 双 0。在 run 触发后、rollout 步进前预热，窗口到达时直接采样。
+SAMPLE_POD_READY=""
+kubectl -n "$ROLLOUT_NS" delete pod canary-sample --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
+if kubectl -n "$ROLLOUT_NS" run canary-sample --image="$SAMPLE_IMAGE" --restart=Never --command -- sleep 600 >/dev/null 2>&1 \
+   && kubectl -n "$ROLLOUT_NS" wait --for=condition=Ready pod/canary-sample --timeout=90s >/dev/null 2>&1; then
+  SAMPLE_POD_READY=1; ok "采样 pod 预热就绪（50% 窗口内直接采样）"
+else
+  bad "采样 pod 预热失败（50% 窗口内将现拉兜底）"
+fi
+
 # ---------- 4. Rollout 步进轮询 + 50% 窗口流量采样 ----------
 SAMPLED=""; WEIGHT50=""
 for i in $(seq 1 60); do
@@ -89,12 +100,17 @@ for i in $(seq 1 60); do
   PH=$(echo "$RO" | jget "d['items'][0]['status']['phase'] if d.get('items') else ''")
   if [ "$W" = "50" ] && [ -z "$WEIGHT50" ]; then
     WEIGHT50=1
-    # 等双版本副本都 ready 再采样：weight=50 刚落状态时 stable 还在滚动更新，
-    # 立即采样会全打到 canary（endpoints 里没有 stable pod），比例失真。
+    # 等双版本副本都 ready 且滚动收敛（ready==spec，无滚动更新在途）再采样：
+    # weight=50 刚落状态时 stable/canary 都可能处于滚动收缩中（endpoints 短暂为空），
+    # 立即采样会 40 次 curl 全失败 → v0.0.1/v0.0.2 双 0。
     for r in $(seq 1 24); do
-      SR=$(kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-      CR=$(kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD-canary" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-      [ "${SR:-0}" -ge 2 ] 2>/dev/null && [ "${CR:-0}" -ge 2 ] 2>/dev/null && break
+      SR=$(kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD" -o jsonpath='{.status.readyReplicas} {.spec.replicas}' 2>/dev/null)
+      CR=$(kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD-canary" -o jsonpath='{.status.readyReplicas} {.spec.replicas}' 2>/dev/null)
+      SRr=${SR%% *}; SRs=${SR##* }; CRr=${CR%% *}; CRs=${CR##* }
+      if [ "${SRr:-0}" -ge 2 ] 2>/dev/null && [ "${CRr:-0}" -ge 2 ] 2>/dev/null \
+         && [ "${SRr:-0}" = "${SRs:-x}" ] 2>/dev/null && [ "${CRr:-0}" = "${CRs:-x}" ] 2>/dev/null; then
+        SR=$SRr; CR=$CRr; break
+      fi
       sleep 5
     done
     # 流量采样双分支：NodePort（kind 基线）→ localhost 直采；
@@ -111,16 +127,31 @@ for i in $(seq 1 60); do
     else
       SPORT=$(kubectl -n "$ROLLOUT_NS" get svc "$TRAFFIC_SVC" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
       if [ -n "$SPORT" ]; then
-        kubectl -n "$ROLLOUT_NS" delete pod canary-sample --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
-        kubectl -n "$ROLLOUT_NS" run canary-sample --image=curlimages/curl:8.8.0 --restart=Never --command -- sleep 600 >/dev/null 2>&1
-        if kubectl -n "$ROLLOUT_NS" wait --for=condition=Ready pod/canary-sample --timeout=90s >/dev/null 2>&1; then
-          OUT=$(kubectl -n "$ROLLOUT_NS" exec canary-sample -- sh -c "for i in $(seq 1 40); do curl -s --max-time 3 http://$TRAFFIC_SVC:$SPORT/; echo; done" 2>/dev/null)
-          V1=$(echo "$OUT" | grep -c 'v0\.0\.1'); V2=$(echo "$OUT" | grep -c 'v0\.0\.2')
+        # 采样 pod 已预热（3.5）；未就绪才现拉兜底，避免 30s 窗口耗在 pod 启动上
+        if [ -z "$SAMPLE_POD_READY" ]; then
+          kubectl -n "$ROLLOUT_NS" delete pod canary-sample --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
+          kubectl -n "$ROLLOUT_NS" run canary-sample --image="$SAMPLE_IMAGE" --restart=Never --command -- sleep 600 >/dev/null 2>&1
+          kubectl -n "$ROLLOUT_NS" wait --for=condition=Ready pod/canary-sample --timeout=90s >/dev/null 2>&1
         fi
+        # 双 0 = 采样执行失败（endpoints 抖动/exec 报错），窗口内最多重试 3 次
+        EXEC_ERR="$(mktemp)"   # exec stderr 落临时文件，用毕即清（不残留 /tmp）
+        EXECDbg=""
+        for try in 1 2 3; do
+          if kubectl -n "$ROLLOUT_NS" get pod canary-sample -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q True; then
+            OUT=$(kubectl -n "$ROLLOUT_NS" exec canary-sample -- sh -c "for i in $(seq -s ' ' 1 40); do curl -s --max-time 3 http://$TRAFFIC_SVC:$SPORT/; echo; done" 2>"$EXEC_ERR")
+            V1=$(echo "$OUT" | grep -c 'v0\.0\.1'); V2=$(echo "$OUT" | grep -c 'v0\.0\.2')
+            [ "$((V1 + V2))" -gt 0 ] 2>/dev/null && break
+            EXECDbg="exec_err=$(tail -c 120 "$EXEC_ERR" 2>/dev/null | tr '\n' ' ')"
+          else
+            EXECDbg="sample_pod_not_ready"
+          fi
+          sleep 3
+        done
         kubectl -n "$ROLLOUT_NS" delete pod canary-sample --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
+        rm -f "$EXEC_ERR"
       fi
     fi
-    echo "  [采样@50%] stable=$SR canary=$CR nodePort=${NPORT:-none} trafficSvc=$TRAFFIC_SVC 流量 v0.0.1=$V1 v0.0.2=$V2"
+    echo "  [采样@50%] stable=$SR canary=$CR nodePort=${NPORT:-none} trafficSvc=$TRAFFIC_SVC 流量 v0.0.1=$V1 v0.0.2=$V2${EXECDbg:+ $EXECDbg}"
     if [ -n "$SR" ] && [ -n "$CR" ] && [ "$SR" -gt 0 ] 2>/dev/null && [ "$CR" -gt 0 ] 2>/dev/null \
        && [ "$V1" -ge 10 ] 2>/dev/null && [ "$V2" -ge 10 ] 2>/dev/null; then
       SAMPLED=1; ok "50% 暂停窗口：双版本副本并存($SR/$CR)且双版本真实流量($V1/$V2)"

@@ -18,23 +18,8 @@ if ! curl -sk -o /dev/null --max-time 5 "${BASE}/targets"; then
     exit 1
 fi
 CURL="${CURL:-curl -sk}"
-PASS=0; FAIL=0
-# ---------- 认证（auth ON 环境由脚本动态换取 token，无需人工解析中间输出） ----------
-# 优先级：外部 TOKEN > password grant 动态获取；KC_* 可覆盖，默认值与 hub chart realm JSON 一致
-export no_proxy="${no_proxy:-*}" NO_PROXY="${NO_PROXY:-*}"
-KC_ISSUER="${KC_ISSUER:-https://www.sdpworkflow.com/keycloak/realms/sdp}"
-KC_CLIENT="${KC_CLIENT:-sdp-console}"
-KC_USER="${KC_USER:-admin}"
-KC_PASS="${KC_PASS:-sdp@12345}"
-if [ -z "${TOKEN:-}" ]; then
-  TOKEN=$(curl -sk -s "$KC_ISSUER/protocol/openid-connect/token" \
-    -d grant_type=password -d client_id="$KC_CLIENT" \
-    -d username="$KC_USER" -d password="$KC_PASS" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)
-  [ -n "$TOKEN" ] || { echo "错误: token 获取失败（$KC_ISSUER client=$KC_CLIENT user=$KC_USER）" >&2; exit 1; }
-  echo "  [info] token 获取成功（$KC_ISSUER）" >&2
-fi
-AUTH=(); [ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
+# ---------- 认证与断言骨架（单一真源 e2e-common.sh；本脚本的计数版 req 在下方覆盖定义） ----------
+. "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 req() { # method path body
   local m="$1" p="$2" b="${3:-}"
   local out code
@@ -48,8 +33,6 @@ req() { # method path body
   else FAIL=$((FAIL+1)); echo "FAIL $code $m $p  << ${body:0:200}" >&2; fi
   echo "$body"
 }
-jqf() { python3 -c "import sys,json;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1" 2>/dev/null; }
-
 TS=$(date +%s)
 echo "===== 1) 组织 / 服务树 ====="
 R=$(req POST "/orgs" "{\"name\":\"E2E冒烟$TS\",\"slug\":\"e2e-smoke-$TS\"}")

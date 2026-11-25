@@ -148,7 +148,7 @@ log "预检 3/3: TOKEN 获取能力"
 if [[ -n "${TOKEN}" ]]; then
     log "使用环境变量提供的 TOKEN（长度 ${#TOKEN}）"
 else
-    TOK="$(curl -sk -s --max-time 10 "${KC_ISSUER}/protocol/openid-connect/token" \
+    TOK="$(${CURL} -s --max-time 10 "${KC_ISSUER}/protocol/openid-connect/token" \
         -d grant_type=password -d client_id="${KC_CLIENT}" \
         -d username="${KC_USER}" -d password="${KC_PASS}" \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)"

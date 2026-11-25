@@ -12,39 +12,35 @@ set -u
 BASE="${BASE:-https://www.sdpworkflow.com/api/v1}"
 CURL="${CURL:-curl -sk}"
 NS="${NS:-sdp-workflow}"
+REPLICAS="${REPLICAS:-4}"   # rollout 副本基线（复位段/rolloutConfig/终态断言单一来源）
 ROLLOUT_NS="${ROLLOUT_NS:-sdp-run}"
 STABLE_IMG="${STABLE_IMG:-swr.cn-north-4.myhuaweicloud.com/sdp-20261022/nginx-canary:v0.0.1}"
 CANARY_IMG="${CANARY_IMG:-swr.cn-north-4.myhuaweicloud.com/sdp-20261022/nginx-canary:v0.0.2}"
 WORKLOAD="${WORKLOAD:-example-nginx}"
 export KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
 
-# ---------- 认证（与 e2e-canary.sh 同款） ----------
-export no_proxy="${no_proxy:-*}" NO_PROXY="${NO_PROXY:-*}"
-KC_ISSUER="${KC_ISSUER:-https://www.sdpworkflow.com/keycloak/realms/sdp}"
-KC_CLIENT="${KC_CLIENT:-sdp-console}"; KC_USER="${KC_USER:-admin}"; KC_PASS="${KC_PASS:-sdp@12345}"
-if [ -z "${TOKEN:-}" ]; then
-  TOKEN=$(curl -sk -s "$KC_ISSUER/protocol/openid-connect/token" \
-    -d grant_type=password -d client_id="$KC_CLIENT" \
-    -d username="$KC_USER" -d password="$KC_PASS" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)
-  [ -n "$TOKEN" ] || { echo "错误: token 获取失败" >&2; exit 1; }
-fi
-AUTH=(); [ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
-PASS=0; FAIL=0
-ok()  { PASS=$((PASS+1)); echo "PASS $*"; }
-bad() { FAIL=$((FAIL+1)); echo "FAIL $*"; }
-req() {
-  local m="$1" p="$2" b="${3:-}" out code
-  if [ -n "$b" ]; then
-    out=$($CURL -w "\n%{http_code}" -X "$m" "$BASE$p" -H 'Content-Type: application/json' ${AUTH[@]+"${AUTH[@]}"} -d "$b")
-  else
-    out=$($CURL -w "\n%{http_code}" -X "$m" "$BASE$p" ${AUTH[@]+"${AUTH[@]}"})
+# ---------- 0. 环境复位：清理上一轮 gate 遗留的 rollout 并复位基线（同 e2e-canary.sh） ----------
+# 遗留 rollout 的 controller 会与新 rollout 互踩副本数，导致步进/终态抖动。
+for PAIR in $(kubectl -n "$ROLLOUT_NS" get rollouts -o jsonpath='{range .items[*]}{.metadata.name}:{.spec.workloadRef} {end}' 2>/dev/null); do
+  RONAME="${PAIR%%:*}"; ROWL="${PAIR##*:}"
+  if [ "$ROWL" = "$WORKLOAD" ]; then
+    kubectl -n "$ROLLOUT_NS" delete rollout "$RONAME" --ignore-not-found >/dev/null 2>&1
+    echo "  [复位] 清理遗留 rollout ${RONAME}（workload=${WORKLOAD}）"
   fi
-  code="${out##*$'\n'}"; echo "${out%$'\n'*}"
-  [[ "$code" =~ ^2 ]] || echo "  [http $code] $m $p" >&2
-}
-jqf() { python3 -c "import sys,json;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1" 2>/dev/null; }
-jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1" 2>/dev/null; }
+done
+if kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD" >/dev/null 2>&1; then
+  kubectl -n "$ROLLOUT_NS" scale deploy "$WORKLOAD" --replicas="$REPLICAS" >/dev/null 2>&1
+  kubectl -n "$ROLLOUT_NS" scale deploy "$WORKLOAD-canary" --replicas=0 >/dev/null 2>&1
+  for i in $(seq 1 18); do
+    R=$(kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+    [ "${R:-0}" -ge 2 ] 2>/dev/null && break
+    sleep 5
+  done
+  echo "  [复位] stable 基线副本就绪=${R:-0}/$REPLICAS"
+fi
+
+# ---------- 认证与断言骨架（单一真源 e2e-common.sh） ----------
+. "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 
 TS=$(date +%s)
 # ---------- 1. 资源准备 ----------
@@ -59,7 +55,7 @@ ENV=$(req POST "/environments" "{\"componentId\":\"$COMP\",\"key\":\"ex-env-$TS\
 # ---------- 2. release 流水线 + Release 任务（单 stable 直发） ----------
 PIPE=$(req POST "/pipelines" "{\"componentId\":\"$COMP\",\"name\":\"Example发布流水线$TS\",\"kind\":\"release\"}" | jqf "d['data']['id']")
 STAGE=$(req POST "/pipelines/$PIPE/stages" "{\"name\":\"rel-stage\",\"sortOrder\":1}" | jqf "d['data']['id']")
-ROLLOUT="{\"workloadRef\":\"$WORKLOAD\",\"replicas\":4,\"stableImage\":\"$STABLE_IMG\",\"canaryImage\":\"$CANARY_IMG\",\"steps\":[{\"setWeight\":50},{\"pause\":{\"duration\":\"30s\"}},{\"setWeight\":100}],\"healthCheck\":{\"type\":\"HTTPProbe\",\"intervalSeconds\":10,\"failureThreshold\":3,\"httpPath\":\"/\"},\"trafficRouting\":{\"type\":\"DeploymentWeight\"},\"autoRollback\":true}"
+ROLLOUT="{\"workloadRef\":\"$WORKLOAD\",\"replicas\":$REPLICAS,\"stableImage\":\"$STABLE_IMG\",\"canaryImage\":\"$CANARY_IMG\",\"steps\":[{\"setWeight\":50},{\"pause\":{\"duration\":\"30s\"}},{\"setWeight\":100}],\"healthCheck\":{\"type\":\"HTTPProbe\",\"intervalSeconds\":10,\"failureThreshold\":3,\"httpPath\":\"/\"},\"trafficRouting\":{\"type\":\"DeploymentWeight\"},\"autoRollback\":true}"
 TASK=$(req POST "/stages/$STAGE/tasks" "{\"name\":\"rel-task\",\"type\":\"Release\",\"displayOrder\":1,\"rolloutConfig\":$ROLLOUT}" | jqf "d['data']['id']")
 [ -n "$PIPE" ] && [ -n "$STAGE" ] && [ -n "$TASK" ] && ok "release 流水线 pipe=$PIPE stage=$STAGE task=$TASK" || { bad "流水线创建"; exit 1; }
 
@@ -89,8 +85,9 @@ RC=$(kubectl -n "$ROLLOUT_NS" get deploy "$WORKLOAD-canary" -o jsonpath='{.statu
 echo "  [终态] run=$RUNPH weight=$FW stableReady=$RD canaryReady=$RC"
 [ "$RUNPH" = "Succeeded" ] && ok "run 终态 Succeeded" || bad "run 终态=$RUNPH"
 [ "$FW" = "100" ] && ok "最终权重 100%" || bad "最终权重=$FW"
-if [ "${RD:-0}" -ge 1 ] 2>/dev/null; then ok "stable $WORKLOAD 就绪副本=$RD"; else bad "stable 未就绪"; fi
-if [ "${RC:-0}" -ge 1 ] 2>/dev/null; then ok "canary $WORKLOAD-canary 就绪副本=$RC"; else bad "canary 未就绪"; fi
+# weight=100 终态语义（与 rollout controller 一致）：canary 副本占满，stable 收缩归零
+if [ "${RC:-0}" -eq "$REPLICAS" ] 2>/dev/null; then ok "canary $WORKLOAD-canary 副本占满($RC/$REPLICAS)"; else bad "canary 副本=${RC:-0}，期望占满 $REPLICAS"; fi
+if [ "${RD:-0}" = "0" ] 2>/dev/null; then ok "stable $WORKLOAD 已收缩归零（weight=100 语义）"; else bad "stable 未归零（ready=${RD:-0}）"; fi
 
 echo "RESULT: PASS=$PASS FAIL=$FAIL  run=$RUN"
 [ "$FAIL" -eq 0 ]

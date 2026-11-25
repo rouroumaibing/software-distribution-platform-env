@@ -9,7 +9,7 @@
 | `centos-stream-9-64bit-env.sh` | CentOS Stream 9 (x86_64) | 通用 ECS 节点：docker + containerd 路线 |
 | `hce-2.0-64bit-env.sh` | Huawei Cloud EulerOS 2.0 (x86_64) | **CCE 托管 K8s 节点**：复用宿主 containerd，走 nerdctl + buildkitd 路线（禁装 docker / containerd.io，会与 CCE 托管 containerd.service 冲突） |
 | `hce-2.0-64bit-deploy.sh` | Huawei Cloud EulerOS 2.0 (x86_64) | **SDP 平台一键部署（依赖 harbor）**：工具检查 → ns/secrets（幂等）→ postgresql → hub/console/runner（组件包）；网关/DNS/验证不在职责内 |
-| `deploy-without-harbor.sh` | 任意云 K8s（外部 OCI registry） | **SDP 平台一键部署（无需 harbor）**：证书+4 TLS secret+sdp-ca → 平台网关 → Envoy proxy 资源收敛 → 默认 SC 预检 → 委托 run.sh 把组件包直推任意 OCI registry（如 SWR）并 helm 安装；镜像不必事先入 harbor |
+| `deploy-without-harbor.sh` | 任意云 K8s（外部 OCI registry） | **SDP 平台一键部署（无需 harbor）**：证书+4 TLS secret+sdp-ca → 平台网关 → Envoy proxy 资源收敛 → 默认 SC 预检 → 委托 run.sh 把组件包直推任意 OCI registry（如 SWR）并 helm 安装；镜像不必事先入 harbor。拉取凭据经 `--pull-secret` 配置（默认 `default-secret`，留空=公开仓库）；`--pg-image` 接受相对 `--registry` 的 `name:tag` 或完整镜像地址 |
 | `run.sh` | —— | 部署运行入口（组件包 → 推镜像 → helm install）；`deploy-without-harbor.sh` 的前置/推送/安装委托对象 |
 
 ### E2E 验证脚本（云上节点直跑）
@@ -45,7 +45,7 @@ CANARY_IMG=swr.cn-north-4.myhuaweicloud.com/sdp-20261022/nginx-canary:v0.0.2 \
 ./gate-cloud.sh --only=canary
 ```
 
-可覆盖环境变量：`BASE`、`TOKEN`、`KUBECONFIG`、`STABLE_IMG`、`CANARY_IMG`（另含 `KC_ISSUER/KC_CLIENT/KC_USER/KC_PASS`、`CURL`）。
+可覆盖环境变量：`BASE`、`TOKEN`、`KUBECONFIG`、`STABLE_IMG`、`CANARY_IMG`（另含 `KC_ISSUER/KC_CLIENT/KC_USER/KC_PASS`、`CURL`）；canary/example 另支持 `SAMPLE_IMAGE`（流量采样 pod 镜像，离线环境覆盖为私有 registry 地址）与 `REPLICAS`（复位/灰度基线副本数）。认证与断言骨架（token 换取 / `req` / `jqf` / `ok` / `bad` / `CURL`）抽在 `e2e-common.sh`，四个脚本 `source` 共享；smoke 保留自己的计数版 `req`（覆盖 common 定义）。
 
 ### 环境清理脚本（云上节点直跑，与部署/验收同源）
 

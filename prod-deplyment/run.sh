@@ -1,6 +1,6 @@
 #!/bin/bash
 # prod-deployment 部署脚本（云上托管 K8s）
-# 流程：检查工作目录下组件包 -> 通配匹配解压 -> 上传镜像到 registry -> helm3 安装 chart（不检查安装结果）
+# 流程：检查工作目录下组件包 -> 通配匹配解压 -> 上传镜像到 registry -> helm3 安装 chart（渲染预检 + 提交失败即终止；不等待/不验证运行态）
 # 前提：组件包由三仓 build.sh 产出，格式 software-distribution-platform-<组件>-<版本>.tar.gz，
 #       包内含 charts/（chart 源目录）与 images/（docker 归档格式的镜像 tar）。
 # registry 的 project 须预先存在（如 harbor 的 sdp 项目），本脚本不创建。
@@ -18,6 +18,8 @@ KUBECONFIG_PATH=""               # 可选：不传则继承环境 KUBECONFIG
 REGISTRY_USER=""                 # 可选：registry 认证（提供则先 login）
 REGISTRY_PASS=""
 KEYCLOAK_IMAGE=""                # 可选：hub 子 chart 的 keycloak 镜像 repository 覆盖（默认沿用 chart values 的 harbor）
+ROLLOUT_SVC_TARGET_PORT="80"     # canary 灰度服务 targetPort；example nginx 监听 80，覆盖 runner 的 8080 兜底
+ROLLOUT_IMAGE_PULL_SECRET="default-secret"  # canary/stable Pod 拉取私有 registry 镜像的 secret；CCE 预置 default-secret
 RUNTIME="nerdctl"                # 镜像操作运行时：nerdctl | docker
 DRY_RUN=0                        # 1 = 只打印将执行的命令，不实际执行
 
@@ -34,6 +36,8 @@ usage() {
   --registry-user <u>     可选，registry 认证用户（与 --registry-pass 成对）
   --registry-pass <p>     可选，registry 认证口令
   --keycloak-image <repo> 可选，覆盖 hub 子 chart 的 keycloak 镜像 repository（tag 沿用 chart 值）
+  --rollout-target-port <n> canary 灰度服务 targetPort，默认 ${ROLLOUT_SVC_TARGET_PORT}（example nginx 监听 80）
+  --rollout-pull-secret <name> canary/stable Pod 拉取凭据，默认 ${ROLLOUT_IMAGE_PULL_SECRET}；留空=公开仓库
   --runtime <name>        镜像操作运行时 nerdctl|docker，默认 ${RUNTIME}
   --dry-run               只打印将执行的命令，不实际执行
   -h, --help              显示本帮助
@@ -54,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --registry-user)  [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; REGISTRY_USER="$2"; shift 2 ;;
         --registry-pass)  [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; REGISTRY_PASS="$2"; shift 2 ;;
         --keycloak-image) [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; KEYCLOAK_IMAGE="$2"; shift 2 ;;
+        --rollout-target-port) [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; ROLLOUT_SVC_TARGET_PORT="$2"; shift 2 ;;
+        --rollout-pull-secret) [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; ROLLOUT_IMAGE_PULL_SECRET="$2"; shift 2 ;;
         --runtime)        [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; RUNTIME="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -136,24 +142,40 @@ for pkg in "${PKGS[@]}"; do
     #    hub 带 keycloak 子 chart，其镜像默认 harbor.sdpworkflow.com/sdp/keycloak；
     #    --keycloak-image 非空时覆盖 repository（tag 沿用 chart values）。
     helm_sets=(--set "image.imageAddr=${image_ref}" --set "namespace=${NAMESPACE}")
+    # canary 灰度服务 <workload>-sdp 的 targetPort：example nginx 镜像声明 80，
+    # 但 runner 的 resolveServiceTargetPort 从 stable workload 取不到时兜底 8080。
+    # 显式设 80，避免流量采样 curl 打到 8080 空端口（RESULT FAIL）。
+    if [[ "${component}" == "runner" && -n "${ROLLOUT_SVC_TARGET_PORT}" ]]; then
+        helm_sets+=(--set "rollout.serviceTargetPort=${ROLLOUT_SVC_TARGET_PORT}")
+    fi
+    # 私有 registry：canary/stable Pod 显式带拉取凭据。运行命名空间由 runner 动态创建，
+    # 部署期 patch default SA 的时机赶不上，必须在 Pod spec 注入（chart -> env 变量）。
+    if [[ "${component}" == "runner" && -n "${ROLLOUT_IMAGE_PULL_SECRET}" ]]; then
+        helm_sets+=(--set "rollout.imagePullSecret=${ROLLOUT_IMAGE_PULL_SECRET}")
+    fi
     if [[ "${component}" == "hub" && -n "${KEYCLOAK_IMAGE}" ]]; then
         helm_sets+=(--set "keycloak.image.repository=${KEYCLOAK_IMAGE}")
     fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "[dry-run] helm upgrade --install ${component} ${chart_dir} -n ${NAMESPACE} ${helm_sets[*]}"
     else
-        # upgrade --install：首次=install，重复执行=upgrade（幂等；避免 re-run 报 release 已存在）
+        # 渲染预检：渲染失败是确定性错误（模板/schema/CRD 字段面），继续装下一个包必然得到残缺部署——终止部署链
+        if ! helm template "${component}" "${chart_dir}" -n "${NAMESPACE}" "${helm_sets[@]}" >/dev/null 2>&1; then
+            echo "错误: chart 渲染失败（${component}），helm template 预检未过，部署链终止" >&2
+            exit 1
+        fi
+        # upgrade --install：首次=install，重复执行=upgrade（幂等；避免 re-run 报 release 已存在）。
+        # 提交失败多为渲染/schema 级确定性错误，终止而非继续；运行态验证归 e2e，本脚本不 --wait。
         if helm upgrade --install "${component}" "${chart_dir}" -n "${NAMESPACE}" "${helm_sets[@]}" 2>&1 | sed 's/^/[helm] /'; then
             log "helm upgrade --install ${component} 已提交（幂等；不等待/不验证安装结果）"
         else
-            warn "helm upgrade --install ${component} 提交异常（多为 chart 渲染错误），继续下一个包"
+            echo "错误: helm upgrade --install ${component} 提交失败，部署链终止" >&2
+            exit 1
         fi
     fi
 
-    # 清理解压临时目录
-    if [[ "${DRY_RUN}" -ne 1 ]]; then
-        rm -rf "${WORKTMP}"
-    fi
+    # 清理解压临时目录（mktemp 创建目录这一副作用不走 run() 门控，无论何种模式都须回收）
+    rm -rf "${WORKTMP}"
 done
 
 log "全部组件包处理完成"

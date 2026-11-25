@@ -28,7 +28,11 @@ RUNTIME="nerdctl"                 # 镜像操作运行时：nerdctl | docker
 KEYCLOAK_IMAGE=""                 # 可选：覆盖 keycloak 镜像 repository；默认 ${REGISTRY}/keycloak
 STORAGE_CLASS="csi-disk"          # 无默认 SC 时设为默认的 StorageClass（CCE 标准盘）
 GATEWAY_YAML="${SCRIPT_DIR}/gateway-sdp-cce.yaml"
-CERT_DIR="$(cd "${SCRIPT_DIR}/../cert-build/certs" 2>/dev/null && pwd || echo "")"
+PG_MANIFEST="${SCRIPT_DIR}/postgres.yaml"  # hub 依赖的 PostgreSQL；__PG_IMAGE__ 占位符按 --registry 替换
+PG_IMAGE_TAG="postgres:16-alpine"         # PG 镜像名与 tag（须预先存在于 --registry 所指仓库）
+PULL_SECRET="default-secret"      # 私有 registry 拉取凭据（SWR 预置 default-secret）；留空=公开仓库
+CERT_DIR="${SCRIPT_DIR}/../cert-build/certs"  # 固定约定路径（cert-create.sh 产出地）；存在性在使用时刻校验，
+                                              # 不在解析时刻探测——cert-create.sh 生成阶段会创建该目录
 CERT_SCRIPT="${SCRIPT_DIR}/../cert-build/cert-create.sh"
 VERIFY=0                         # 1 = 部署后跑 e2e-smoke 验收
 E2E_BASE="${E2E_BASE:-https://www.sdpworkflow.com/api/v1}"  # 本脚本只服务云端，验收 BASE 显式指向网关
@@ -46,6 +50,10 @@ usage() {
   --keycloak-image <repo>  覆盖 hub 子 chart 的 keycloak 镜像 repository（tag 沿用 chart 值）；默认 ${REGISTRY}/keycloak
   --storage-class <sc>     无默认 SC 时设为默认的 StorageClass，默认 ${STORAGE_CLASS}
   --gateway-yaml <file>    平台网关 yaml，默认 ${GATEWAY_YAML}
+  --pg-manifest <file>     PostgreSQL manifest，默认 ${PG_MANIFEST}
+  --pg-image <name:tag>    PostgreSQL 镜像，默认 ${PG_IMAGE_TAG}；name:tag 相对 --registry 拼接，
+                            含 / 的值视为完整引用不再拼接；须已推送到目标仓库
+  --pull-secret <name>     私有 registry 拉取凭据名，默认 ${PULL_SECRET}；留空=公开仓库
   --cert-dir <dir>         证书目录（ca.crt/console.crt/...），默认 ${CERT_DIR:-未找到}
   --cert-script <file>     证书生成脚本，默认 ${CERT_SCRIPT}
   --verify                 部署后跑 e2e-smoke 验收
@@ -65,8 +73,11 @@ while [[ $# -gt 0 ]]; do
         --keycloak-image) [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; KEYCLOAK_IMAGE="$2"; shift 2 ;;
         --storage-class)  [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; STORAGE_CLASS="$2"; shift 2 ;;
         --gateway-yaml)   [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; GATEWAY_YAML="$2"; shift 2 ;;
+        --pg-manifest)    [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; PG_MANIFEST="$2"; shift 2 ;;
+        --pg-image)       [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; PG_IMAGE_TAG="$2"; shift 2 ;;
         --cert-dir)       [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; CERT_DIR="$2"; shift 2 ;;
         --cert-script)    [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; CERT_SCRIPT="$2"; shift 2 ;;
+        --pull-secret)    [[ $# -lt 2 ]] && { echo "错误: $1 缺少参数"; usage; exit 1; }; PULL_SECRET="$2"; shift 2 ;;
         --verify)         VERIFY=1; shift ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -91,6 +102,7 @@ for tool in kubectl helm tar python3 "${RUNTIME}"; do
 done
 [[ -n "${REGISTRY}" ]] || { echo "错误: --registry 必填"; usage; exit 1; }
 [[ -f "${GATEWAY_YAML}" ]] || { echo "错误: 网关 yaml 不存在: ${GATEWAY_YAML}"; exit 1; }
+[[ -f "${PG_MANIFEST}" ]] || { echo "错误: PG manifest 不存在: ${PG_MANIFEST}"; exit 1; }
 
 # ---------- 阶段 1：kubeconfig + 集群可达 ----------
 if [[ -z "${KUBECONFIG_PATH}" && -f /root/.kube/config ]]; then
@@ -110,13 +122,41 @@ else
     run kubectl create ns "${NAMESPACE}"
 fi
 
+# ---------- 阶段 1.6：PostgreSQL（hub 与 keycloak 的硬依赖） ----------
+# hub chart 不带 PG，10-postgres.yaml 已挪到本目录自包含；镜像按 --registry 替换。
+pg_phase() {
+    # PG_IMAGE_TAG 含 / 即完整引用（已含仓库 host 或 project），不再拼 REGISTRY
+    local pg_ref="${PG_IMAGE_TAG}"
+    [[ "${pg_ref}" == */* ]] || pg_ref="${REGISTRY}/${pg_ref}"
+    log "阶段 1.6：PostgreSQL（镜像 ${pg_ref}）"
+    local pg_tmp
+    pg_tmp="$(mktemp)"
+    sed -e "s#__PG_IMAGE__#${pg_ref}#g" \
+        -e "s#__PULL_SECRET__#${PULL_SECRET}#g" "${PG_MANIFEST}" > "${pg_tmp}"
+    # Pod 创建时快照 SA 的 imagePullSecrets，之后 patch 不影响存量 Pod；
+    # PG manifest 已显式声明凭据，此处 patch 前置仅为 chart 未声明时的兜底。
+    run kubectl -n "${NAMESPACE}" patch sa default \
+        -p "{\"imagePullSecrets\":[{\"name\":\"${PULL_SECRET}\"}]}" \
+        || warn "default SA patch 失败（凭据已存在时可忽略）"
+    run kubectl apply -f "${pg_tmp}"
+    if [[ "${DRY_RUN}" -ne 1 ]]; then
+        log "等待 PostgreSQL Ready（hub/keycloak 依赖）"
+        kubectl -n "${NAMESPACE}" rollout status deploy/postgres --timeout=180s \
+            || warn "PG 未在 180s 内 Ready，后续 hub/keycloak 可能 CrashLoop"
+    fi
+    rm -f "${pg_tmp}"
+}
+pg_phase
+
 ensure_secret() {  # ensure_secret <name> <type> [kubectl create secret 参数...]
+                   # 声明式收敛：期望内容与集群不一致即替换（create --dry-run 输出后 apply），
+                   # 证书重新生成后重跑部署即生效——幂等对象是 secret 内容而非名字
     local name="$1" type="$2"; shift 2
-    if kubectl get secret "${name}" -n "${NAMESPACE}" >/dev/null 2>&1; then
-        log "secret ${name} 已存在，跳过"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] kubectl create secret ${type} ${name} -n ${NAMESPACE} $* --dry-run=client -o yaml | kubectl apply -f -"
     else
-        log "创建 secret ${name} (${type})"
-        run kubectl create secret "${type}" "${name}" -n "${NAMESPACE}" "$@"
+        log "收敛 secret ${name} (${type}) 到期望内容（apply 语义）"
+        kubectl create secret "${type}" "${name}" -n "${NAMESPACE}" "$@" --dry-run=client -o yaml | kubectl apply -f -
     fi
 }
 
@@ -125,9 +165,10 @@ ensure_secret() {  # ensure_secret <name> <type> [kubectl create secret 参数..
 # 平台 chart 实际期望 console-tls/hub-tls/hub-keycloak-tls（generic 三 key）与 console-ingress-tls（tls 类型）。
 # 故此处显式建 4 个正确命名的 secret，不依赖 cert-create.sh 的输出命名。
 cert_phase() {
-    log "阶段 2：证书与 TLS secret"
-    if [[ -z "${CERT_DIR}" || ! -d "${CERT_DIR}" ]]; then
-        warn "证书目录不可用（${CERT_DIR:-未设置}），尝试生成"
+    log "阶段 2：证书与 TLS secret（CERT_DIR=${CERT_DIR}）"
+    # 证书目录不存在时生成；cert-create.sh 会创建该目录，CERT_DIR 为固定约定路径，生成后无需重解析
+    if [[ ! -d "${CERT_DIR}" ]]; then
+        warn "证书目录不存在（${CERT_DIR}），运行 cert-create.sh 生成"
         [[ -f "${CERT_SCRIPT}" ]] && bash "${CERT_SCRIPT}" "${NAMESPACE}" || { echo "错误: 证书生成失败"; exit 1; }
     fi
     # 证书文件缺失才生成（避免每次重跑都换新 CA，使既有集群 secret 失效）
@@ -181,10 +222,52 @@ envoy_preflight() {
             || warn "EnvoyProxy patch 失败，见下方手动命令"
         return 0
     fi
-    warn "未找到 EnvoyProxy CR，无法自动收敛 envoy proxy 资源；8 核节点可能因 CPU 不足导致 Gateway PROGRAMMED=False。"
-    warn "  手动修复（EG 就地更新 proxy deployment，ELB/Service 不变）："
-        warn "    kubectl -n kube-system edit cm envoy-gateway-config   # envoyDeployment 的 resources.requests 设为 cpu=500m,memory=512Mi"
-    warn "    kubectl -n kube-system rollout restart deploy/envoy-gateway"
+    # CCE 官方插件不暴露 EnvoyProxy CR，配置在 kube-system/envoy-gateway-config 的
+    # envoy-gateway.yaml 里（envoyDeployment.container.resources.requests 默认 8000m）。
+    # 收敛到 500m/512Mi，否则 8 核节点上 proxy 副本 Insufficient cpu、Gateway 无法 PROGRAMMED。
+    if kubectl -n kube-system get cm envoy-gateway-config >/dev/null 2>&1; then
+        log "发现 CCE EG configmap，收敛 envoy proxy requests 至 500m/512Mi"
+        local eg_cm_tmp
+        eg_cm_tmp=$(mktemp)
+        kubectl -n kube-system get cm envoy-gateway-config -o json > "${eg_cm_tmp}"
+        python3 - "${eg_cm_tmp}" <<'PYCODE' || { warn "EG configmap 收敛失败，保留原配置"; rm -f "${eg_cm_tmp}"; return 0; }
+import json, sys
+p = sys.argv[1]
+with open(p) as f:
+    d = json.load(f)
+raw = d["data"]["envoy-gateway.yaml"]
+lines = raw.splitlines(keepends=True)
+in_envoy = False
+in_req = False
+done = 0
+for i, line in enumerate(lines):
+    if "envoyDeployment:" in line:
+        in_envoy = True
+    if in_envoy and line.strip() == "requests:":
+        in_req = True
+        continue
+    if in_req and line.strip().startswith("cpu:"):
+        indent = line[:len(line)-len(line.lstrip())]
+        lines[i] = indent + "cpu: 500m\n"
+        done += 1
+    elif in_req and line.strip().startswith("memory:"):
+        indent = line[:len(line)-len(line.lstrip())]
+        lines[i] = indent + "memory: 512Mi\n"
+        done += 1
+        in_req = False
+        in_envoy = False
+if done != 2:
+    sys.exit("expected 2 resource fields, got %d" % done)
+d["data"]["envoy-gateway.yaml"] = "".join(lines)
+with open(p, "w") as f:
+    json.dump(d, f)
+PYCODE
+        run kubectl -n kube-system replace -f "${eg_cm_tmp}" || warn "EG configmap replace 失败"
+        rm -f "${eg_cm_tmp}"
+        run kubectl -n kube-system rollout restart deploy/envoy-gateway || warn "EG controller 重启失败"
+        return 0
+    fi
+    warn "未找到 EnvoyProxy CR 或 CCE EG configmap，无法自动收敛 envoy proxy 资源。"
 }
 envoy_preflight
 
@@ -210,16 +293,27 @@ storageclass_preflight() {
 storageclass_preflight
 
 # ---------- 阶段 6：推送镜像并 helm 安装（委托 run.sh） ----------
-# run.sh 已支持 --keycloak-image 透传（T10）；helm 用 upgrade --install（幂等，re-run 不报 release 已存在）。
+# run.sh 已支持 --keycloak-image / --rollout-pull-secret 透传；helm 用 upgrade --install（幂等，re-run 不报 release 已存在）。
 deploy_phase() {
     log "阶段 6：推送镜像并 helm 安装（委托 run.sh）"
     local keycloak_img="${KEYCLOAK_IMAGE:-${REGISTRY}/keycloak}"
-    local args=(--registry "${REGISTRY}" --keycloak-image "${keycloak_img}" --runtime "${RUNTIME}")
+    local args=(--registry "${REGISTRY}" --keycloak-image "${keycloak_img}" --runtime "${RUNTIME}" \
+        --rollout-pull-secret "${PULL_SECRET}")
     [[ -n "${KUBECONFIG_PATH}" ]] && args+=(--kubeconfig "${KUBECONFIG_PATH}")
     [[ "${DRY_RUN}" -eq 1 ]] && args+=(--dry-run)
     run bash "${SCRIPT_DIR}/run.sh" "${args[@]}"
 }
 deploy_phase
+
+# ---------- 阶段 6.5：runner 工作命名空间拉取凭据 ----------
+# runner 安装的 chart 会创建 sdp-run 命名空间；其中 canary pod 用 default SA，
+# 私有 registry 场景需挂拉取凭据，否则 ErrImagePull 401。凭据名单一来源 ${PULL_SECRET}。
+if [[ "${DRY_RUN}" -ne 1 ]] && kubectl get ns sdp-run >/dev/null 2>&1; then
+    log "阶段 6.5：sdp-run default SA 挂拉取凭据"
+    kubectl -n sdp-run patch sa default \
+        -p "{\"imagePullSecrets\":[{\"name\":\"${PULL_SECRET}\"}]}" \
+        || warn "sdp-run default SA patch 失败"
+fi
 
 # ---------- 阶段 7：可选 e2e-smoke 验收 ----------
 if [[ "${VERIFY}" -eq 1 ]]; then
